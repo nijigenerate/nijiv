@@ -8,6 +8,8 @@ import std.file : exists, getcwd;
 import std.path : buildPath, dirName;
 import std.stdio : writeln, writefln;
 import std.string : fromStringz, toStringz;
+import std.math : exp;
+import std.algorithm : clamp;
 
 import bindbc.opengl;
 import bindbc.sdl;
@@ -15,7 +17,9 @@ import bindbc.sdl;
 import ogl = opengl.opengl_backend;
 import opengl.opengl_backend : NjgResult, UnityRendererConfig, UnityResourceCallbacks, RendererHandle, PuppetHandle, FrameConfig, CommandQueueView, SharedBufferSnapshot;
 import opengl.opengl_backend : initOpenGLBackend, OpenGLBackendInit;
+import nlshim.core.render.backends.opengl.runtime : oglResizeViewport;
 import core.runtime : Runtime;
+import nlshim.core.runtime_state : inSetViewport;
 enum MaskDrawableKind : uint { Part, Mask }
 
 extern(C) alias NjgLogFn = void function(const(char)* message, size_t length, void* userData);
@@ -32,6 +36,7 @@ alias FnSetLogCallback = extern(C) void function(NjgLogFn, void*);
 alias FnRtInit = extern(C) void function();
 alias FnRtTerm = extern(C) void function();
 alias FnGetSharedBuffers = extern(C) NjgResult function(RendererHandle, SharedBufferSnapshot*);
+alias FnSetPuppetScale = extern(C) NjgResult function(PuppetHandle, float, float);
 
 struct UnityApi {
     void* lib;
@@ -47,6 +52,7 @@ struct UnityApi {
     FnGetSharedBuffers getSharedBuffers;
     FnRtInit rtInit;
     FnRtTerm rtTerm;
+    FnSetPuppetScale setPuppetScale;
 }
 
 string dlErrorString() {
@@ -76,6 +82,7 @@ UnityApi loadUnityApi(string libPath) {
     api.flushCommands = loadSymbol!FnFlushCommandBuffer(lib, "njgFlushCommandBuffer");
     api.setLogCallback = loadSymbol!FnSetLogCallback(lib, "njgSetLogCallback");
     api.getSharedBuffers = loadSymbol!FnGetSharedBuffers(lib, "njgGetSharedBuffers");
+    api.setPuppetScale = loadSymbol!FnSetPuppetScale(lib, "njgSetPuppetScale");
     // Explicit runtime init/term provided by DLL.
     api.rtInit = loadSymbol!FnRtInit(lib, "njgRuntimeInit");
     api.rtTerm = loadSymbol!FnRtTerm(lib, "njgRuntimeTerm");
@@ -167,6 +174,7 @@ void main(string[] args) {
     FrameConfig frameCfg;
     frameCfg.viewportWidth = glInit.drawableW;
     frameCfg.viewportHeight = glInit.drawableH;
+    float puppetScale = 1.0f;
 
     bool running = true;
     int frameCount = 0;
@@ -189,6 +197,20 @@ void main(string[] args) {
                         SDL_GL_GetDrawableSize(glInit.window, &glInit.drawableW, &glInit.drawableH);
                         frameCfg.viewportWidth = glInit.drawableW;
                         frameCfg.viewportHeight = glInit.drawableH;
+                        inSetViewport(glInit.drawableW, glInit.drawableH);
+                        oglResizeViewport(glInit.drawableW, glInit.drawableH);
+                    }
+                    break;
+                case SDL_MOUSEWHEEL:
+                    // Scroll up to zoom in, down to zoom out. Use exponential step.
+                    {
+                        float step = 0.1f; // ~10% per notch
+                        float factor = cast(float)exp(step * ev.wheel.y);
+                        puppetScale = clamp(puppetScale * factor, 0.1f, 10.0f);
+                        auto res = api.setPuppetScale(puppet, puppetScale, puppetScale);
+                        if (res != NjgResult.Ok) {
+                            writeln("njgSetPuppetScale failed: ", res);
+                        }
                     }
                     break;
                 default:

@@ -404,27 +404,27 @@ private void renderStage(ref PartDrawPacket packet, bool advanced) {
 
     glEnableVertexAttribArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, cast(void*)vertexOffsetBytes);
+    glVertexAttribPointer(0, 1, GL_FLOAT, GL_FALSE, 0, cast(void*)vertexOffsetBytes);
 
     glEnableVertexAttribArray(1);
     glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, cast(void*)vertexLane1Offset);
+    glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, 0, cast(void*)vertexLane1Offset);
 
     glEnableVertexAttribArray(2);
     glBindBuffer(GL_ARRAY_BUFFER, uvBuffer);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, cast(void*)uvOffsetBytes);
+    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 0, cast(void*)uvOffsetBytes);
 
     glEnableVertexAttribArray(3);
     glBindBuffer(GL_ARRAY_BUFFER, uvBuffer);
-    glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, 0, cast(void*)uvLane1Offset);
+    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 0, cast(void*)uvLane1Offset);
 
     glEnableVertexAttribArray(4);
     glBindBuffer(GL_ARRAY_BUFFER, deformBuffer);
-    glVertexAttribPointer(4, 2, GL_FLOAT, GL_FALSE, 0, cast(void*)deformOffsetBytes);
+    glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, 0, cast(void*)deformOffsetBytes);
 
     glEnableVertexAttribArray(5);
     glBindBuffer(GL_ARRAY_BUFFER, deformBuffer);
-    glVertexAttribPointer(5, 2, GL_FLOAT, GL_FALSE, 0, cast(void*)deformLane1Offset);
+    glVertexAttribPointer(5, 1, GL_FLOAT, GL_FALSE, 0, cast(void*)deformLane1Offset);
 
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
     glDrawElements(GL_TRIANGLES, cast(int)indexCount, GL_UNSIGNED_SHORT, null);

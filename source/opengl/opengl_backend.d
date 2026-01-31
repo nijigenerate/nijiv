@@ -185,7 +185,7 @@ alias MaskApplyPacket = NlCmds.MaskApplyPacket;
 alias DynamicCompositePass = NlCmds.DynamicCompositePass;
 alias DynamicCompositeSurface = NlCmds.DynamicCompositeSurface;
 alias NlMaskKind = NlCmds.MaskDrawableKind;
-import nlshim.core.runtime_state : inSetRenderBackend;
+import nlshim.core.runtime_state : inSetRenderBackend, inSetViewport;
 import nlshim.math : mat4;
 import nlshim.core.render.backends.opengl.part : partShader, gopacity, gMultColor, gScreenColor, mvp, offset;
 
@@ -235,6 +235,8 @@ OpenGLBackendInit initOpenGLBackend(int width, int height, bool isTest) {
 
     // Attach RenderBackend so nlshim Texture can allocate handles.
     inSetRenderBackend(new RenderBackend());
+    // Keep nlshim viewport state in sync with actual drawable size.
+    inSetViewport(drawableW, drawableH);
     if (!gBackendInitialized) {
         gBackendInitialized = true;
         // Initialize nlshim OpenGL resources to back the queue callbacks.
