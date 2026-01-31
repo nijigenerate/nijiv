@@ -1,0 +1,111 @@
+/*
+    nijilive Shapes Node
+    previously Inochi2D Shapes Node
+
+    Copyright © 2020, Inochi2D Project
+    Copyright © 2024, nijigenerate Project
+    Distributed under the 2-Clause BSD License, see LICENSE file.
+    
+    Authors: Luna Nielsen
+*/
+module nlshim.core.nodes.shapes;
+import nlshim.core.nodes.part;
+import nlshim.core.nodes;
+import nlshim.core;
+import nlshim.math;
+import nlshim.core.render.scheduler : RenderContext;
+
+/**
+    A Shape Node
+*/
+struct ShapeNode {
+    /**
+        The breakpoint in which the Shape Node activates
+    */
+    vec2 breakpoint;
+
+    /**
+        The shape data
+    */
+    Vec2Array shapeData;
+}
+
+/**
+    NOTE: This needs to be here to allow for deserialization of this type
+*/
+mixin InNode!Shapes;
+
+/**
+    Contains various deformation shapes that can be applied to
+    children of this node
+*/
+@TypeId("Shapes")
+class Shapes : Node {
+protected:
+
+    override
+    string typeId() { return "Shapes"; }
+    
+public:
+    /**
+        Constructs a new Shapes node
+    */
+    this(Node parent = null) {
+        super(parent);
+        requireDynamicTask();
+    }
+
+    /**
+        A list of the shape offsets to apply per part
+    */
+    ShapeNode[][Drawable] shapes;
+
+    /**
+        The cursor inside the Shapes node
+    */
+    vec2 selector;
+
+    void processShapes() {
+        foreach(Drawable part, nodes; shapes) {
+            
+            size_t nodeLen = nodes.length;
+            float[] weights = new float[nodeLen];
+            float accWeight = 0;
+
+            enum MAX_DIST = 1.5;
+
+            // Calculate weighted average for each breakpoint
+            for(size_t i = 0; i < nodes.length; i++) {
+                weights[i] = MAX_DIST-(nodes[i].breakpoint.distance(selector)/MAX_DIST);
+                accWeight += weights[i];
+            }
+
+            // Acount for weights outside 1.0
+            if (accWeight > 1) {
+                for(size_t i = 0; i < weights.length; i++) {
+                    weights[i] /= nodeLen;
+                }
+            }
+
+            // Make sure our vertices buffer is ready
+            Vec2Array vertices = Vec2Array(part.vertices.length);
+            foreach(i; 0..vertices.length) {
+                vertices[i] = vec2(0);
+            }
+
+            // Apply our weighted offsets
+            foreach(node; nodes) {
+                for (size_t i = 0; i < node.shapeData.length; i++) {
+                    vertices[i] += weights[i] * node.shapeData[i];
+                }
+            }
+            
+        }
+    }
+
+    override
+    protected void runDynamicTask(ref RenderContext ctx) {
+        processShapes();
+        super.runDynamicTask(ctx);
+    }
+}

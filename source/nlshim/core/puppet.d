@@ -1,0 +1,1097 @@
+module nlshim.core.puppet;
+import nlshim.fmt.serialize;
+import nlshim.core;
+import nlshim.math;
+import std.algorithm.sorting;
+import std.algorithm.mutation : SwapStrategy;
+import std.exception;
+import std.format;
+import std.file;
+import std.path : extension;
+import std.json;
+import nlshim.core.render.graph_builder;
+import nlshim.core.render.command_emitter : RenderCommandEmitter;
+import nlshim.core.render.backends : RenderBackend, BackendEnum, RenderGpuState, SelectedBackend, SelectedBackendIsOpenGL;
+version (UseQueueBackend) {
+    import nlshim.core.render.backends.queue : CommandQueueEmitter;
+} else static if (SelectedBackendIsOpenGL) {
+    import nlshim.core.render.backends.opengl.queue : RenderQueue;
+}
+import nlshim.core.runtime_state : currentRenderBackend;
+import nlshim.core.nodes : NotifyReason;
+import nlshim.utils.snapshot : Snapshot;
+
+import nlshim.core.render.scheduler;
+import nlshim.core.render.profiler : profileScope;
+import nlshim.core.texture_types : Filtering;
+
+/**
+    Magic value meaning that the model has no thumbnail
+*/
+enum NO_THUMBNAIL = uint.max;
+
+enum PuppetAllowedUsers {
+    /**
+        Only the author(s) are allowed to use the puppet
+    */
+    OnlyAuthor = "onlyAuthor",
+
+    /**
+        Only licensee(s) are allowed to use the puppet
+    */
+    OnlyLicensee = "onlyLicensee",
+
+    /**
+        Everyone may use the model
+    */
+    Everyone = "everyone"
+}
+
+enum PuppetAllowedRedistribution {
+    /**
+        Redistribution is prohibited
+    */
+    Prohibited = "prohibited",
+
+    /**
+        Redistribution is allowed, but only under
+        the same license as the original.
+    */
+    ViralLicense = "viralLicense",
+
+    /**
+        Redistribution is allowed, and the puppet
+        may be redistributed under a different
+        license than the original.
+
+        This goes in conjunction with modification rights.
+    */
+    CopyleftLicense = "copyleftLicense"
+}
+
+enum PuppetAllowedModification {
+    /**
+        Modification is prohibited
+    */
+    Prohibited = "prohibited",
+
+    /**
+        Modification is only allowed for personal use
+    */
+    AllowPersonal = "allowPersonal",
+
+    /**
+        Modification is allowed with redistribution,
+        see allowedRedistribution for redistribution terms.
+    */
+    AllowRedistribute = "allowRedistribute",
+}
+
+class PuppetUsageRights {
+    /**
+        Who is allowed to use the puppet?
+    */
+    @Optional
+    PuppetAllowedUsers allowedUsers = PuppetAllowedUsers.OnlyAuthor;
+
+    /**
+        Whether violence content is allowed
+    */
+    @Optional
+    bool allowViolence = false;
+
+    /**
+        Whether sexual content is allowed
+    */
+    @Optional
+    bool allowSexual = false;
+
+    /**
+        Whether commerical use is allowed
+    */
+    @Optional
+    bool allowCommercial = false;
+
+    /**
+        Whether a model may be redistributed
+    */
+    @Optional
+    PuppetAllowedRedistribution allowRedistribution = PuppetAllowedRedistribution.Prohibited;
+
+    /**
+        Whether a model may be modified
+    */
+    @Optional
+    PuppetAllowedModification allowModification = PuppetAllowedModification.Prohibited;
+
+    /**
+        Whether the author(s) must be attributed for use.
+    */
+    @Optional
+    bool requireAttribution = false;
+}
+
+/**
+    Puppet meta information
+*/
+class PuppetMeta {
+
+    /**
+        Name of the puppet
+    */
+    string name;
+    /**
+        Version of the nijilive spec that was used for creating this model
+    */
+    @Name("version")
+    string version_ = "1.0-alpha";
+
+    /**
+        Rigger(s) of the puppet
+    */
+    @Optional
+    string rigger;
+
+    /**
+        Artist(s) of the puppet
+    */
+    @Optional
+    string artist;
+
+    /**
+        Usage Rights of the puppet
+    */
+    @Optional
+    PuppetUsageRights rights;
+
+    /**
+        Copyright string
+    */
+    @Optional
+    string copyright;
+
+    /**
+        URL of license
+    */
+    @Optional
+    string licenseURL;
+
+    /**
+        Contact information of the first author
+    */
+    @Optional
+    string contact;
+
+    /**
+        Link to the origin of this puppet
+    */
+    @Optional
+    string reference;
+
+    /**
+        Texture ID of this puppet's thumbnail
+    */
+    @Optional
+    uint thumbnailId = NO_THUMBNAIL;
+
+    /**
+        Whether the puppet should preserve pixel borders.
+        This feature is mainly useful for puppets which use pixel art.
+    */
+    @Optional
+    bool preservePixels = false;
+}
+
+/**
+    Puppet physics settings
+*/
+class PuppetPhysics {
+    @Optional
+    float pixelsPerMeter = 1000;
+
+    @Optional
+    float gravity = 9.8;
+}
+
+/**
+    A puppet
+*/
+class Puppet {
+private:
+    /**
+        An internal puppet root node
+    */
+    @Ignore
+    Node puppetRootNode;
+
+    /**
+        A list of parts that are not masked by other parts
+
+        for Z sorting
+    */
+    @Ignore
+    Node[] rootParts;
+
+    /**
+        A list of drivers that need to run to update the puppet
+    */
+    Driver[] drivers;
+
+    /**
+        A list of parameters that are driven by drivers
+    */
+    Driver[Parameter] drivenParameters;
+
+    /**
+        A dictionary of named animations
+    */
+    Animation[string] animations;
+    RenderCommandEmitter commandEmitter;
+    RenderGraphBuilder renderGraph;
+    public RenderBackend renderBackend;
+    TaskScheduler renderScheduler;
+    RenderContext renderContext;
+    struct FrameChangeState {
+        bool attributeDirty;
+        bool structureDirty;
+
+        bool any() const { return attributeDirty || structureDirty; }
+
+        void mark(NotifyReason reason) {
+            final switch (reason) {
+                case NotifyReason.StructureChanged:
+                    structureDirty = true;
+                    attributeDirty = true;
+                    break;
+                case NotifyReason.AttributeChanged:
+                case NotifyReason.Initialized:
+                case NotifyReason.Transformed:
+                    attributeDirty = true;
+                    break;
+            }
+        }
+    }
+    FrameChangeState pendingFrameChanges;
+    bool schedulerCacheValid = false;
+    bool forceFullRebuild = true;
+
+    void scanPartsRecurse(ref Node node, bool driversOnly = false) {
+
+        // Don't need to scan null nodes
+        if (node is null) return;
+
+        // Collect Drivers
+        if (Driver part = cast(Driver)node) {
+            drivers ~= part;
+            foreach(Parameter param; part.getAffectedParameters())
+                drivenParameters[param] = part;
+        } else if (!driversOnly) {
+            // Collect drawable nodes only if we aren't inside a Composite node
+
+            if (DynamicComposite dcomposite = cast(DynamicComposite)node) {
+                dcomposite.scanParts();
+                rootParts ~= dcomposite;
+                driversOnly = true;
+
+            } else if (Composite composite = cast(Composite)node) {
+                // Composite nodes handle and keep their own root node list, as such we should just draw them directly
+                composite.scanParts();
+                rootParts ~= composite;
+
+                // For this subtree, only look for Drivers
+                driversOnly = true;
+            } else if (Part part = cast(Part)node) {
+                // Collect Part nodes
+                part.ignorePuppet = false;
+                rootParts ~= part;
+            }
+            // Non-part nodes just need to be recursed through,
+            // they don't draw anything.
+        }
+
+        // Recurse through children nodes
+        foreach(child; node.children) {
+            scanPartsRecurse(child, driversOnly);
+        }
+    }
+
+    final void scanParts(bool reparent = false)(ref Node node) {
+        version (NijiliveRenderProfiler) auto __prof = profileScope("Puppet.ScanParts");
+
+        // We want rootParts to be cleared so that we
+        // don't draw the same part multiple times
+        // and if the node tree changed we want to reflect those changes
+        // not the old node tree.
+        rootParts = [];
+
+        // Same for drivers
+        drivers = [];
+        drivenParameters.clear();
+
+        this.scanPartsRecurse(node);
+
+        // To make sure the GC can collect any nodes that aren't referenced
+        // anymore, we clear its children first, then assign its new child
+        // to our "new" root node. In some cases the root node will be
+        // quite different.
+        static if (reparent) { 
+            if (puppetRootNode !is null) puppetRootNode.clearChildren();
+            node.parent = puppetRootNode;
+        }
+    }
+
+    void selfSort() {
+        sort!((a, b) => a.zSort > b.zSort, SwapStrategy.stable)(rootParts);
+    }
+
+    FrameChangeState consumeFrameChanges() {
+        auto flags = pendingFrameChanges;
+        if (forceFullRebuild) {
+            flags.structureDirty = true;
+            flags.attributeDirty = true;
+            forceFullRebuild = false;
+        }
+        pendingFrameChanges = FrameChangeState.init;
+        return flags;
+    }
+
+    void rebuildRenderTasks(Node rootNode) {
+        if (rootNode is null) return;
+        version (NijiliveRenderProfiler) auto __prof = profileScope("TaskScheduler.Rebuild");
+        renderScheduler.clearTasks();
+        rootNode.registerRenderTasks(renderScheduler);
+        auto rootForTasks = rootNode;
+        renderScheduler.addTask(TaskOrder.Parameters, TaskKind.Parameters, (ref RenderContext ctx) {
+            updateParametersAndDrivers(rootForTasks);
+        });
+        schedulerCacheValid = true;
+    }
+
+    void updateParametersAndDrivers(Node rootNode) {
+        if (rootNode is null) return;
+        auto profiling = profileScope("Puppet.Update.Parameters");
+        if (renderParameters) {
+            foreach(parameter; parameters) {
+                if (!enableDrivers || parameter !in drivenParameters) {
+                    parameter.update();
+                }
+            }
+        }
+
+        rootNode.transformChanged();
+
+        if (renderParameters && enableDrivers) {
+            foreach (driver; drivers) {
+                if (driver is null) continue;
+                if (!driver.renderEnabled()) continue;
+                driver.updateDriver();
+            }
+        }
+    }
+
+    Node findNode(Node n, string name) {
+
+        // Name matches!
+        if (n.name == name) return n;
+
+        // Recurse through children
+        foreach(child; n.children) {
+            if (Node c = findNode(child, name)) return c;
+        }
+
+        // Not found
+        return null;
+    }
+
+    Node findNode(Node n, uint uuid) {
+
+        // Name matches!
+        if (n.uuid == uuid) return n;
+
+        // Recurse through children
+        foreach(child; n.children) {
+            if (Node c = findNode(child, uuid)) return c;
+        }
+
+        // Not found
+        return null;
+    }
+public:
+    Node getPuppetRootNode() { return puppetRootNode; }
+    void recordNodeChange(NotifyReason reason) {
+        pendingFrameChanges.mark(reason);
+    }
+    void requestFullRenderRebuild() {
+        forceFullRebuild = true;
+        schedulerCacheValid = false;
+    }
+
+public:
+    /**
+        Meta information about this puppet
+    */
+    @Name("meta")
+    PuppetMeta meta;
+
+    /**
+        Global physics settings for this puppet
+    */
+    @Name("physics")
+    PuppetPhysics physics;
+
+    /**
+        The root node of the puppet
+    */
+    @Name("nodes", "Root Node")
+    Node root;
+
+    /**
+        Parameters
+    */
+    @Name("param", "Parameters")
+    @Optional
+    Parameter[] parameters;
+
+    /**
+        Parameters
+    */
+    @Name("automation", "Automation")
+    @Optional
+    Automation[] automation;
+
+    /**
+        INP Texture slots for this puppet
+    */
+    @Ignore
+    Texture[] textureSlots;
+
+    /**
+        Extended vendor data
+    */
+    @Ignore
+    ubyte[][string] extData;
+
+    /**
+        Whether parameters should be rendered
+    */
+    @Ignore
+    bool renderParameters = true;
+
+    /**
+        Whether drivers should run
+    */
+    @Ignore
+    bool enableDrivers = true;
+
+    /**
+        Puppet render transform
+
+        This transform does not affect physics
+    */
+    Transform transform;
+
+    /**
+        Creates a new puppet from nothing ()
+    */
+    this() { 
+        this.puppetRootNode = new Node(this); 
+        this.meta = new PuppetMeta();
+        this.physics = new PuppetPhysics();
+        root = new Node(this.puppetRootNode); 
+        root.name = "Root";
+        transform = Transform(vec3(0, 0, 0));
+        version (UseQueueBackend) {
+            commandEmitter = new CommandQueueEmitter();
+        } else static if (SelectedBackendIsOpenGL) {
+            commandEmitter = new RenderQueue();
+        }
+        renderGraph = new RenderGraphBuilder();
+        renderBackend = currentRenderBackend();
+        renderScheduler = new TaskScheduler();
+        renderContext.renderGraph = &renderGraph;
+        renderContext.renderBackend = renderBackend;
+        renderContext.gpuState = RenderGpuState.init;
+        requestFullRenderRebuild();
+    }
+
+    /**
+        Creates a new puppet from a node tree
+    */
+    this(Node root) {
+        this.meta = new PuppetMeta();
+        this.physics = new PuppetPhysics();
+        this.root = root;
+        this.puppetRootNode = new Node(this);
+        this.root.name = "Root";
+        this.scanParts!true(this.root);
+        transform = Transform(vec3(0, 0, 0));
+        this.selfSort();
+        version (UseQueueBackend) {
+            commandEmitter = new CommandQueueEmitter();
+        } else static if (SelectedBackendIsOpenGL) {
+            commandEmitter = new RenderQueue();
+        }
+        renderGraph = new RenderGraphBuilder();
+        renderBackend = currentRenderBackend();
+        renderScheduler = new TaskScheduler();
+        renderContext.renderGraph = &renderGraph;
+        renderContext.renderBackend = renderBackend;
+        renderContext.gpuState = RenderGpuState.init;
+        requestFullRenderRebuild();
+    }
+
+    Node actualRoot() {
+        auto node = root;
+        while (node && node.parent && node.parent != puppetRootNode) node = node.parent;        
+        return node;
+    }
+
+    /**
+        Updates the nodes
+    */
+    final void update() {
+        auto profilingFrame = profileScope("Puppet.Update");
+
+        {
+            auto profiling = profileScope("Puppet.Update.Transform");
+            transform.update();
+        }
+
+        // Update Automators
+        {
+            auto profiling = profileScope("Puppet.Update.Automation");
+            foreach(auto_; automation) {
+                auto_.update();
+            }
+        }
+
+        auto rootNode = actualRoot();
+        if (rootNode is null) return;
+
+        renderContext.renderGraph = &renderGraph;
+        renderContext.renderBackend = renderBackend;
+        renderContext.gpuState = RenderGpuState.init;
+
+        bool pendingStructure = pendingFrameChanges.structureDirty;
+        if (forceFullRebuild || !schedulerCacheValid || pendingStructure) {
+            version (NijiliveRenderProfiler) auto __profRebuild = profileScope("Puppet.Update.RebuildRenderTasks.Initial");
+            rebuildRenderTasks(rootNode);
+        }
+
+        {
+            auto profilingInit = profileScope("Puppet.Update.InitAndParameters");
+            renderScheduler.executeRange(renderContext, TaskOrder.Init, TaskOrder.Parameters);
+        }
+
+        FrameChangeState frameChanges;
+        {
+            version (NijiliveRenderProfiler) auto __prof = profileScope("Puppet.Update.ConsumeFrameChanges");
+            frameChanges = consumeFrameChanges();
+        }
+        if (frameChanges.structureDirty) {
+            {
+                version (NijiliveRenderProfiler) auto __profRebuild = profileScope("Puppet.Update.RebuildRenderTasks.StructureDirty");
+                rebuildRenderTasks(rootNode);
+            }
+            {
+                auto profilingInit = profileScope("Puppet.Update.InitAndParameters");
+                renderScheduler.executeRange(renderContext, TaskOrder.Init, TaskOrder.Parameters);
+            }
+            {
+                version (NijiliveRenderProfiler) auto __prof = profileScope("Puppet.Update.ConsumeFrameChanges.Additional");
+                auto additional = consumeFrameChanges();
+                frameChanges.attributeDirty |= additional.attributeDirty;
+                frameChanges.structureDirty |= additional.structureDirty;
+            }
+        }
+
+        auto profilingSetup = profileScope("Puppet.Update.Setup");
+        renderGraph.beginFrame();
+
+        {
+            auto profilingExecute = profileScope("Puppet.Update.ExecuteTasks");
+            renderScheduler.executeRange(renderContext, TaskOrder.PreProcess, TaskOrder.Final);
+        }
+    }
+
+    /**
+        Reset drivers/physics nodes
+    */
+    final void resetDrivers() {
+        foreach(driver; drivers) {
+            driver.reset();
+        }
+
+        // Update so that the timestep gets reset.
+        import nlshim : inUpdate;
+        inUpdate();
+    }
+
+    /**
+        Returns the index of a parameter by name
+    */
+    ptrdiff_t findParameterIndex(string name) {
+        foreach(i, parameter; parameters) {
+            if (parameter.name == name) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+        Returns a parameter by UUID
+    */
+    Parameter findParameter(uint uuid) {
+        foreach(i, parameter; parameters) {
+            if (parameter.uuid == uuid) {
+                return parameter;
+            }
+        }
+        return null;
+    }
+
+    /**
+        Gets if a node is bound to ANY parameter.
+    */
+    bool getIsNodeBound(Node n) {
+        foreach(i, parameter; parameters) {
+            if (parameter.hasAnyBinding(n)) return true;
+        }
+        return false;
+    }
+
+    /**
+        Draws the puppet
+    */
+    final void draw() {
+        version (UseQueueBackend) {
+            if (commandEmitter is null || renderBackend is null) {
+                drawImmediateFallback();
+                return;
+            }
+            if (renderGraph.empty()) {
+                drawImmediateFallback();
+                return;
+            }
+
+            version (NijiliveRenderProfiler) auto __prof = profileScope("CommandEmitter.Frame");
+            {
+                version (NijiliveRenderProfiler) auto __profBegin = profileScope("CommandEmitter.BeginFrame");
+                commandEmitter.beginFrame(renderBackend, renderContext.gpuState);
+            }
+            {
+                version (NijiliveRenderProfiler) auto __profPlayback = profileScope("CommandEmitter.RenderGraphPlayback");
+                renderGraph.playback(commandEmitter);
+            }
+            {
+                version (NijiliveRenderProfiler) auto __profEnd = profileScope("CommandEmitter.EndFrame");
+                commandEmitter.endFrame(renderBackend, renderContext.gpuState);
+            }
+        } else static if (SelectedBackendIsOpenGL) {
+            if (commandEmitter is null || renderBackend is null) {
+                drawImmediateFallback();
+                return;
+            }
+            if (renderGraph.empty()) {
+                drawImmediateFallback();
+                return;
+            }
+
+            version (NijiliveRenderProfiler) auto __prof = profileScope("CommandEmitter.Frame");
+            {
+                version (NijiliveRenderProfiler) auto __profBegin = profileScope("CommandEmitter.BeginFrame");
+                commandEmitter.beginFrame(renderBackend, renderContext.gpuState);
+            }
+            {
+                version (NijiliveRenderProfiler) auto __profPlayback = profileScope("CommandEmitter.RenderGraphPlayback");
+                renderGraph.playback(commandEmitter);
+            }
+            {
+                version (NijiliveRenderProfiler) auto __profEnd = profileScope("CommandEmitter.EndFrame");
+                commandEmitter.endFrame(renderBackend, renderContext.gpuState);
+            }
+        } else {
+            drawImmediateFallback();
+        }
+        Snapshot.processPending();
+        /*
+        // debug
+        foreach (c; findNodesType!Composite(actualRoot())) {
+            auto d = c.delegated;
+            if (d)
+                d.drawBounds();
+        }
+        foreach (d; findNodesType!DynamicComposite(actualRoot())) {
+            if (d)
+                d.drawBounds();
+        }
+        */
+    }
+
+    void drawImmediateFallback() {
+        this.selfSort();
+        foreach(rootPart; rootParts) {
+            if (!rootPart.renderEnabled) continue;
+            rootPart.drawOne();
+        }
+    }
+
+    /**
+        Removes a parameter from this puppet
+    */
+    void removeParameter(Parameter param) {
+        import std.algorithm.searching : countUntil;
+        import std.algorithm.mutation : remove;
+        ptrdiff_t idx = parameters.countUntil(param);
+        if (idx >= 0) {
+            parameters = parameters.remove(idx);
+        }
+    }
+
+    /**
+        Rescans the puppet's nodes
+
+        Run this every time you change the layout of the puppet's node tree
+    */
+    final void rescanNodes() {
+        auto node = actualRoot();
+        this.scanParts!false(node);
+    }
+
+    /**
+        Updates the texture state for all texture slots.
+    */
+    final void updateTextureState() {
+
+        // Update filtering mode for texture slots
+        foreach(texutre; textureSlots) {
+            texutre.setFiltering(meta.preservePixels ? Filtering.Point : Filtering.Linear);
+        }
+    }
+
+    /**
+        Finds Node by its name
+    */
+    T find(T = Node)(string name) if (is(T : Node)) {
+        return cast(T)findNode(root, name);
+    }
+
+    /**
+        Finds Node by its unique id
+    */
+    T find(T: Node)(uint uuid) {
+        return cast(T)findNode(root, uuid);
+    }
+
+
+    T find(T = Parameter)(string name) if (is(T : Parameter)) {
+        return cast(T)parameters[findParameterIndex(name)];
+    }
+    T find(T: Parameter)(uint uuid) {
+        return cast(T)findParameter(uuid);
+    }
+
+    T find(T: Resource)(uint uuid) {
+        Node node = this.findNode(root, uuid);
+        if (node) return node;
+        Parameter param = this.findParameter(uuid);
+        return param;
+    }
+    /**
+        Returns all the parts in the puppet
+    */
+    Part[] getAllParts() {
+        return findNodesType!Part(root);
+    }
+
+    /**
+        Finds nodes based on their type
+    */
+    final T[] findNodesType(T)(Node n) if (is(T : Node) || is (T : NodeFilter)) {
+        T[] nodes;
+
+        if (T item = cast(T)n) {
+            nodes ~= item;
+        }
+
+        // Recurse through children
+        foreach(child; n.children) {
+            nodes ~= findNodesType!T(child);
+        }
+
+        return nodes;
+    }
+
+    /**
+        Adds a texture to a new slot if it doesn't already exist within this puppet
+    */
+    final uint addTextureToSlot(Texture texture) {
+        import std.algorithm.searching : canFind;
+
+        // Add texture if we can't find it.
+        if (!textureSlots.canFind(texture)) textureSlots ~= texture;
+        return cast(uint)textureSlots.length-1;
+    }
+
+    /**
+        Populate texture slots with all visible textures in the model
+    */
+    final void populateTextureSlots() {
+        if (textureSlots.length > 0) textureSlots.length = 0;
+        
+        foreach(part; getAllParts) {
+            foreach(texture; part.textures) {
+                if (texture) this.addTextureToSlot(texture);
+            }
+        }
+    }
+
+    /**
+        Finds a texture by its runtime UUID
+    */
+    final Texture findTextureByRuntimeUUID(uint uuid) {
+        foreach(ref slot; textureSlots) {
+            if (slot.getRuntimeUUID())
+                return slot;
+        }
+        return null;
+    }
+
+    /**
+        Sets thumbnail of this puppet
+    */
+    final void setThumbnail(Texture texture) {
+        if (this.meta.thumbnailId == NO_THUMBNAIL) {
+            this.meta.thumbnailId = this.addTextureToSlot(texture);
+        } else {
+            textureSlots[this.meta.thumbnailId] = texture;
+        }
+    }
+
+    /**
+        Gets the texture slot index for a texture
+
+        returns -1 if none was found
+    */
+    final ptrdiff_t getTextureSlotIndexFor(Texture texture) {
+        import std.algorithm.searching : countUntil;
+        return textureSlots.countUntil(texture);
+    }
+
+    /**
+        Clears this puppet's thumbnail
+
+        By default it does not delete the texture assigned, pass in true to delete texture
+    */
+    final void clearThumbnail(bool deleteTexture = false) {
+        import std.algorithm.mutation : remove;
+        if (deleteTexture) textureSlots = remove(textureSlots, this.meta.thumbnailId);
+        this.meta.thumbnailId = NO_THUMBNAIL;
+    }
+
+    /**
+        This cursed toString implementation outputs the puppet's
+        nodetree as a pretty printed tree.
+
+        Please use a graphical viewer instead of this if you can,
+        eg. nijigenerate.
+    */
+    override
+    string toString() {
+        import std.format : format;
+        import std.range : repeat, takeExactly;
+        import std.array : array;
+        bool[] lineSet;
+
+        string toStringBranch(Node n, int indent, bool showLines = true) {
+
+            lineSet ~= n.children.length > 0;
+            string getLineSet() {
+                if (indent == 0) return "";
+                string s = "";
+                foreach(i; 1..lineSet.length) {
+                    s ~= lineSet[i-1] ? "│ " : "  ";
+                }
+                return s;
+            }
+
+            string iden = getLineSet();
+
+            string s = "%s[%s] %s <%s>
+".format(n.children.length > 0 ? "╭─" : "", n.typeId, n.name, n.uuid);
+            foreach(i, child; n.children) {
+                string term = "├→";
+                if (i == n.children.length-1) {
+                    term = "╰→";
+                    lineSet[indent] = false;
+                }
+                s ~= "%s%s%s".format(iden, term, toStringBranch(child, indent+1));
+            }
+
+            lineSet.length--;
+
+            return s;
+        }
+
+        return toStringBranch(root, 0);
+    }
+
+
+    void serializeSelf(ref InochiSerializer serializer) {
+        serializer.putKey("meta");
+        serializer.serializeValue(meta);
+        serializer.putKey("physics");
+        serializer.serializeValue(physics);
+        serializer.putKey("nodes");
+        serializer.serializeValue(root);
+        serializer.putKey("param");
+        serializer.serializeValue(parameters);
+        serializer.putKey("automation");
+        serializer.serializeValue(automation);
+        serializer.putKey("animations");
+        serializer.serializeValue(animations);
+    }
+
+    /**
+        Serializes a puppet
+    */
+    void serialize(ref InochiSerializer serializer) {
+        auto state = serializer.structBegin;
+        serializeSelf(serializer);
+        serializer.structEnd(state);
+    }
+
+    version (UseQueueBackend)
+    public RenderCommandEmitter queueEmitter() {
+        return commandEmitter;
+    }
+
+    /**
+        Deserializes a puppet
+    */
+    SerdeException deserializeFromFghj(Fghj data) {
+        if (auto exc = data["meta"].deserializeValue(this.meta)) return exc;
+        if (!data["physics"].isEmpty)
+            if (auto exc = data["physics"].deserializeValue(this.physics)) return exc;
+        if (auto exc = data["nodes"].deserializeValue(this.root)) return exc;
+
+        // Allow parameter loading to be overridden (for nijigenerate)
+        foreach(key; data["param"].byElement) {
+            this.parameters ~= inParameterCreate(key);
+        }
+
+        // Deserialize automation
+        foreach(key; data["automation"].byElement) {
+            string type;
+            if (auto exc = key["type"].deserializeValue(type)) return exc;
+
+            if (inHasAutomationType(type)) {
+                auto auto_ = inInstantiateAutomation(type, this);
+                auto_.deserializeFromFghj(key);
+                this.automation ~= auto_;
+            }
+        }
+        if (!data["animations"].isEmpty) data["animations"].deserializeValue(animations);
+        this.finalizeDeserialization(data);
+
+        return null;
+    }
+
+
+    void reconstruct() {
+        this.root.reconstruct();
+        foreach(parameter; parameters.dup) {
+            parameter.reconstruct(this);
+        }
+        foreach(automation_; automation.dup) {
+            automation_.reconstruct(this);
+        }
+        foreach(ref animation; animations.dup) {
+            animation.reconstruct(this);
+        }
+    }
+
+    void finalize() {
+        this.root.setPuppet(this);
+        this.root.name = "Root";
+        this.puppetRootNode = new Node(this);
+
+        // Finally update link etc.
+        this.root.finalize();
+        foreach(parameter; parameters) {
+            parameter.finalize(this);
+        }
+        foreach(automation_; automation) {
+            automation_.finalize(this);
+        }
+        foreach(ref animation; animations) {
+            animation.finalize(this);
+        }
+        this.scanParts!true(this.root);
+        this.selfSort();
+    }
+    /**
+        Finalizer
+    */
+    void finalizeDeserialization(Fghj data) {
+        // reconstruct object path so that object is located at final position
+        reconstruct();
+        finalize();
+    }
+
+    /**
+        Gets the internal root parts array 
+
+        Do note that some root parts may be Composites instead.
+    */
+    final 
+    ref Node[] getRootParts() {
+        return rootParts;
+    }
+
+    /**
+        Gets a list of drivers
+    */
+    final
+    ref Driver[] getDrivers() {
+        return drivers;
+    }
+
+   /**
+        Gets a mapping from parameters to their drivers
+    */
+    final
+    ref Driver[Parameter] getParameterDrivers() {
+        return drivenParameters;
+    }
+
+    /**
+        Gets the animation dictionary
+    */
+    final
+    ref Animation[string] getAnimations() {
+        return animations;
+    }
+
+    void applyDeformToChildren() {
+        auto nodes = findNodesType!NodeFilter(root);
+        foreach (node; nodes) {
+            node.applyDeformToChildren(parameters);
+        }
+    }
+
+    /**
+        Gets the combined bounds of the puppet
+    */
+    vec4 getCombinedBounds(bool reupdate=false)() {
+        return root.getCombinedBounds!(reupdate, true);
+    }
+
+    void setRootNode(Node node) {
+        if (this.root)
+            this.root.reparent(null, 0);
+        node.reparent(this.puppetRootNode, 0);
+        this.root = node;
+    }
+}
