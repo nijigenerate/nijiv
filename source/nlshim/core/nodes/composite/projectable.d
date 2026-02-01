@@ -181,11 +181,18 @@ protected:
     }
 
     DynamicCompositePass prepareDynamicCompositePass() {
+        import std.stdio : writefln;
+        writefln("[prep-log] begin name=%s(%s) texLen=%s tex0=%s stencil=%s surface=%s",
+            name, uuid, textures.length,
+            textures.length ? cast(void*)textures[0] : cast(void*)null,
+            cast(void*)stencil, cast(void*)offscreenSurface);
         if (textures.length == 0 || textures[0] is null) {
+            writefln("[prep-log] null return: no base texture name=%s(%s)", name, uuid);
             return null;
         }
         if (offscreenSurface is null) {
             offscreenSurface = new DynamicCompositeSurface();
+            writefln("[prep-log] created offscreenSurface name=%s(%s) surface=%s", name, uuid, cast(void*)offscreenSurface);
         }
         size_t count = 0;
         foreach (i; 0 .. offscreenSurface.textures.length) {
@@ -196,6 +203,7 @@ protected:
             }
         }
         if (count == 0) {
+            writefln("[prep-log] null return: texture count=0 name=%s(%s)", name, uuid);
             return null;
         }
         offscreenSurface.textureCount = count;
@@ -206,6 +214,8 @@ protected:
         pass.scale = vec2(transform.scale.x, transform.scale.y);
         pass.rotationZ = transform.rotation.z;
         pass.autoScaled = false;
+        writefln("[prep-log] ok name=%s(%s) pass=%s count=%s scale=(%s,%s) rot=%s",
+            name, uuid, cast(void*)pass, count, pass.scale.x, pass.scale.y, pass.rotationZ);
         return pass;
     }
 
@@ -221,6 +231,26 @@ protected:
         updateBounds();
         vec4 worldBounds = bounds;
         if (!boundsFinite(worldBounds)) {
+            // Force bounds calculation even if global tracking is disabled.
+            vec4 forced = vec4(transform.translation.x, transform.translation.y,
+                               transform.translation.x, transform.translation.y);
+            auto matrix = getDynamicMatrix();
+            foreach (i, vertex; vertices) {
+                vec2 pos = vertex + deformation[i];
+                vec2 vertOriented = vec2(matrix * vec4(pos, 0, 1));
+                forced.x = min(forced.x, vertOriented.x);
+                forced.y = min(forced.y, vertOriented.y);
+                forced.z = max(forced.z, vertOriented.x);
+                forced.w = max(forced.w, vertOriented.y);
+            }
+            worldBounds = forced;
+            bounds = forced;
+            writefln("[init-target] forced bounds recalculation name=%s(%s) bounds=%s", name, uuid, worldBounds);
+        }
+        import std.stdio : writefln;
+        writefln("[init-target] start name=%s(%s) bounds=%s verts=%s deform=%s", name, uuid, worldBounds, vertices.length, deformation.length);
+        if (!boundsFinite(worldBounds)) {
+            writefln("[init-target] fail non-finite bounds=%s name=%s(%s)", worldBounds, name, uuid);
             return false;
         }
 
@@ -247,6 +277,7 @@ protected:
 
         vec2 size = maxPos - minPos;
         if (!sizeFinite(size) || size.x <= 0 || size.y <= 0) {
+            writefln("[init-target] fail size=%s verts=%s deform=%s name=%s(%s)", size, vertices.length, deformation.length, name, uuid);
             return false;
         }
 
@@ -257,6 +288,7 @@ protected:
 
         textures = [new Texture(texWidth, texHeight, 4, false, false), null, null];
         stencil = new Texture(texWidth, texHeight, 1, true, false);
+        writefln("[init-target] ok size=%s tex=%sx%s bounds=%s name=%s(%s)", size, texWidth, texHeight, worldBounds, name, uuid);
         if (prevTexture !is null) {
             prevTexture.dispose();
         }
@@ -785,7 +817,17 @@ public:
         scheduler.addTask(TaskOrder.Post1, TaskKind.PostProcess, &runPostTask1);
         scheduler.addTask(TaskOrder.Post2, TaskKind.PostProcess, &runPostTask2);
 
-        bool allowRenderTasks = !hasProjectableAncestor();
+        bool allowRenderTasks;
+        version (UseQueueBackend) {
+            allowRenderTasks = true; // queue では必ずレンダータスクを積む
+        } else {
+            allowRenderTasks = !hasProjectableAncestor();
+        }
+        debug (UnityDLLLog) {
+            import std.stdio : writefln;
+            writefln("[proj.registerRenderTasks] name=%s(%s) allowRenderTasks=%s hasAncestor=%s",
+                name, uuid, allowRenderTasks, hasProjectableAncestor());
+        }
         if (allowRenderTasks) {
             scheduler.addTask(TaskOrder.RenderBegin, TaskKind.Render, &runRenderBeginTask);
             scheduler.addTask(TaskOrder.Render, TaskKind.Render, &runRenderTask);

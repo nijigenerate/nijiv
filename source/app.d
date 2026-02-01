@@ -19,6 +19,7 @@ import opengl.opengl_backend : NjgResult, UnityRendererConfig, UnityResourceCall
 import opengl.opengl_backend : initOpenGLBackend, OpenGLBackendInit;
 import nlshim.core.render.backends.opengl.runtime : oglResizeViewport;
 import core.runtime : Runtime;
+import nlshim.core.nodes.drawable : inSetUpdateBounds;
 import nlshim.core.runtime_state : inSetViewport;
 enum MaskDrawableKind : uint { Part, Mask }
 
@@ -137,6 +138,8 @@ void main(string[] args) {
         if (glInit.window !is null) SDL_DestroyWindow(glInit.window);
         SDL_Quit();
     }
+    // Ensure drawable size reflects the actual GL framebuffer (handles HiDPI).
+    SDL_GL_GetDrawableSize(glInit.window, &glInit.drawableW, &glInit.drawableH);
 
     // Load the Unity-facing DLL from a nearby nijilive build.
     string exeDir = getcwd();
@@ -159,6 +162,8 @@ void main(string[] args) {
     if (api.rtInit !is null) api.rtInit();
     scope (exit) if (api.rtTerm !is null) api.rtTerm();
     api.setLogCallback(&logCallback, null);
+    // Queue backend needs bounds generation enabled; otherwise bounds stay NaN and offscreen targets fail.
+    inSetUpdateBounds(true);
 
     UnityRendererConfig rendererCfg;
     rendererCfg.viewportWidth = glInit.drawableW;
@@ -170,11 +175,18 @@ void main(string[] args) {
     PuppetHandle puppet;
     enforce(api.loadPuppet(renderer, puppetPath.toStringz, &puppet) == NjgResult.Ok,
         "njgLoadPuppet failed");
-
     FrameConfig frameCfg;
     frameCfg.viewportWidth = glInit.drawableW;
     frameCfg.viewportHeight = glInit.drawableH;
-    float puppetScale = 1.0f;
+    inSetViewport(glInit.drawableW, glInit.drawableH);
+    oglResizeViewport(glInit.drawableW, glInit.drawableH);
+    float puppetScale = 0.25f;
+
+    // Apply initial scale (default 0.25) so that the view starts zoomed out.
+    auto initScaleRes = api.setPuppetScale(puppet, puppetScale, puppetScale);
+    if (initScaleRes != NjgResult.Ok) {
+        writeln("njgSetPuppetScale initial apply failed: ", initScaleRes);
+    }
 
     bool running = true;
     int frameCount = 0;

@@ -12,6 +12,7 @@ import nlshim.core.nodes.common : BlendMode;
 import nlshim.math : vec2, vec3, mat4;
 import nlshim.core.render.backends.opengl.handles : GLTextureHandle;
 import nlshim.core.render.backends : RenderResourceHandle, RenderTextureHandle, BackendEnum, RenderBackend;
+import nlshim.core.render.backends.opengl.composite : oglDrawCompositeQuad;
 
 // ==== Types mirrored from the Unity DLL ABI ====
 alias RendererHandle = void*;
@@ -24,6 +25,7 @@ enum NjgResult : int {
 
 enum NjgRenderCommandKind : uint {
     DrawPart,
+    DrawMask, // align with RenderCommandKind; queue may not emit but keeps ABI in sync
     BeginDynamicComposite,
     EndDynamicComposite,
     BeginMask,
@@ -813,6 +815,13 @@ void renderCommands(const OpenGLBackendInit* gl,
     oglBindDrawableVao();
     // 念のため最初にパート用シェーダをバインドしておく（prog=0防止）。
     partShader.use();
+    debug {
+        import std.stdio : writefln;
+        GLint vao=0, prog=0;
+        glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
+        glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
+        writefln("[vao-debug] vao=%s prog=%s", vao, prog);
+    }
     auto cmds = view.commands[0 .. view.count];
     writeln("[renderCommands] commands this frame=", cmds.length);
     size_t drawCount, beginMaskCount, applyMaskCount, beginMaskContentCount, endMaskCount, beginDynCount, endDynCount;
@@ -849,6 +858,23 @@ void renderCommands(const OpenGLBackendInit* gl,
                 oglUploadDrawableIndices(ibo, idxSlice.dup);
                 p.indexBuffer = ibo;
                 oglExecutePartPacket(p);
+                debug {
+                    import std.stdio : writefln;
+                    GLint[4] aEn;
+                    GLint[4] aStride;
+                    GLint[4] aBuf;
+                    foreach(i; 0 .. 4){
+                        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &aEn[i]);
+                        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &aStride[i]);
+                        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &aBuf[i]);
+                    }
+                    writefln("[attr-debug] en=%s stride=%s buf=%s vOff=%s uvOff=%s defOff=%s",
+                        aEn, aStride, aBuf, p.vertexOffset, p.uvOffset, p.deformOffset);
+                }
+                break;
+            }
+            case NjgRenderCommandKind.DrawMask: {
+                // Not expected from current queue; keep placeholder for ABI completeness.
                 break;
             }
             case NjgRenderCommandKind.BeginMask: {
@@ -923,7 +949,7 @@ void renderCommands(const OpenGLBackendInit* gl,
                 break;
             case NjgRenderCommandKind.BeginDynamicComposite: {
                 beginDynCount++;
-                DynamicCompositePass pass;
+                auto pass = new DynamicCompositePass;
                 auto surf = new DynamicCompositeSurface;
                 surf.textureCount = cmd.dynamicPass.textureCount;
                 foreach(i; 0 .. surf.textureCount) {
@@ -942,7 +968,7 @@ void renderCommands(const OpenGLBackendInit* gl,
             }
             case NjgRenderCommandKind.EndDynamicComposite: {
                 endDynCount++;
-                DynamicCompositePass pass;
+                auto pass = new DynamicCompositePass;
                 auto surf = new DynamicCompositeSurface;
                 surf.textureCount = cmd.dynamicPass.textureCount;
                 foreach(i; 0 .. surf.textureCount) {
@@ -960,6 +986,7 @@ void renderCommands(const OpenGLBackendInit* gl,
                 break;
             }
             default:
+                writeln("[renderCommands] unknown cmd kind=", cast(uint)cmd.kind);
                 break;
         }
     }
