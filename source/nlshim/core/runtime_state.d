@@ -6,7 +6,8 @@ import core.stdc.string : memcpy;
 import nlshim.math : vec3, vec4;
 import nlshim.math.camera : Camera;
 import nlshim.core.render.support : inInitBlending;
-import nlshim.core.render.backends : RenderBackend, RenderResourceHandle;
+import nlshim.core.render.backends : RenderBackend, RenderResourceHandle,
+    DifferenceEvaluationRegion, DifferenceEvaluationResult;
 
 public int[] inViewportWidth;
 public int[] inViewportHeight;

@@ -12,7 +12,6 @@ module nlshim.core;
 
 public import nlshim.core.shader;
 public import nlshim.core.texture;
-public import nlshim.core.resource;
 public import nlshim.core.render.support : BlendMode;
 public import nlshim.core.texture_types;
 public import nlshim.core.runtime_state;
