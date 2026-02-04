@@ -9,6 +9,7 @@ import nlshim.core.render.support;
 import nlshim.core.texture : Texture;
 import nlshim.core.render.backends : RenderResourceHandle;
 import nlshim.core.render.passes : RenderPassKind;
+import nlshim.math.camera : Camera;
 
 /// GPU command kinds; backends switch on these during rendering.
 enum RenderCommandKind {
@@ -100,6 +101,8 @@ class DynamicCompositePass {
     RenderResourceHandle origBuffer;
     int[4] origViewport;
     bool autoScaled;
+    int drawBufferCount;   // number of color attachments active when begun
+    bool hasStencil;
 }
 
 bool tryMakeMaskApplyPacket(Drawable, bool, out MaskApplyPacket packet) { packet = MaskApplyPacket.init; return false; }

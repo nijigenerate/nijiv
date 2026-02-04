@@ -831,6 +831,10 @@ void renderCommands(const OpenGLBackendInit* gl,
         writefln("[vao-debug] vao=%s prog=%s", vao, prog);
     }
     auto cmds = view.commands[0 .. view.count];
+    // Keep backend stateless; the queue already tracks dynamic-composite depth.
+    int dynDepth;
+    int[] dynDrawStack;
+    DynamicCompositePass[] dynPassStack;
     writeln("[renderCommands] commands this frame=", cmds.length);
     size_t drawCount, beginMaskCount, applyMaskCount, beginMaskContentCount, endMaskCount, beginDynCount, endDynCount;
     foreach (cmd; cmds) {
@@ -868,6 +872,10 @@ void renderCommands(const OpenGLBackendInit* gl,
                 oglExecutePartPacket(p);
                 debug {
                     import std.stdio : writefln;
+                    if (dynDrawStack.length > 0) {
+                        auto rm = p.renderMatrix;
+                        writefln("[renderCommands] drawPart inDyn rm00=%.3f rm01=%.3f", rm[0][0], rm[0][1]);
+                    }
                     GLint[4] aEn;
                     GLint[4] aStride;
                     GLint[4] aBuf;
@@ -957,9 +965,12 @@ void renderCommands(const OpenGLBackendInit* gl,
                 break;
             case NjgRenderCommandKind.BeginDynamicComposite: {
                 beginDynCount++;
+                dynDrawStack ~= cast(int)drawCount;
+                dynDepth = cast(int)dynDrawStack.length;
                 writeln("[renderCommands] beginDyn texCount=", cmd.dynamicPass.textureCount,
                         " tex0=", cmd.dynamicPass.textureCount>0 ? cmd.dynamicPass.textures[0] : 0,
-                        " stencil=", cmd.dynamicPass.stencil);
+                        " stencil=", cmd.dynamicPass.stencil,
+                        " drawCount=", drawCount);
                 auto pass = new DynamicCompositePass;
                 auto surf = new DynamicCompositeSurface;
                 surf.textureCount = cmd.dynamicPass.textureCount;
@@ -967,34 +978,50 @@ void renderCommands(const OpenGLBackendInit* gl,
                     surf.textures[i] = toTex(cmd.dynamicPass.textures[i]);
                 }
                 surf.stencil = toTex(cmd.dynamicPass.stencil);
-                surf.framebuffer = cmd.dynamicPass.origBuffer;
                 pass.surface = surf;
                 pass.scale = *cast(vec2*)&cmd.dynamicPass.scale;
                 pass.rotationZ = cmd.dynamicPass.rotationZ;
                 pass.origBuffer = cmd.dynamicPass.origBuffer;
                 pass.origViewport[] = cmd.dynamicPass.origViewport;
                 pass.autoScaled = cmd.dynamicPass.autoScaled;
+                pass.drawBufferCount = cmd.dynamicPass.drawBufferCount;
+                pass.hasStencil = cmd.dynamicPass.hasStencil;
+                dynPassStack ~= pass;
                 oglBeginDynamicComposite(pass);
                 break;
             }
             case NjgRenderCommandKind.EndDynamicComposite: {
                 endDynCount++;
                 writeln("[renderCommands] endDyn");
-                auto pass = new DynamicCompositePass;
-                auto surf = new DynamicCompositeSurface;
-                surf.textureCount = cmd.dynamicPass.textureCount;
-                foreach(i; 0 .. surf.textureCount) {
-                    surf.textures[i] = toTex(cmd.dynamicPass.textures[i]);
+                DynamicCompositePass pass;
+                if (dynPassStack.length) {
+                    pass = dynPassStack[$-1];
+                    dynPassStack.length = dynPassStack.length - 1;
+                } else {
+                    // Fallback: reconstruct (should not happen)
+                    pass = new DynamicCompositePass;
+                    auto surf = new DynamicCompositeSurface;
+                    surf.textureCount = cmd.dynamicPass.textureCount;
+                    foreach(i; 0 .. surf.textureCount) {
+                        surf.textures[i] = toTex(cmd.dynamicPass.textures[i]);
+                    }
+                    surf.stencil = toTex(cmd.dynamicPass.stencil);
+                    pass.surface = surf;
+                    pass.scale = *cast(vec2*)&cmd.dynamicPass.scale;
+                    pass.rotationZ = cmd.dynamicPass.rotationZ;
+                    pass.origBuffer = cmd.dynamicPass.origBuffer;
+                    pass.origViewport[] = cmd.dynamicPass.origViewport;
+                    pass.autoScaled = cmd.dynamicPass.autoScaled;
+                    pass.drawBufferCount = cmd.dynamicPass.drawBufferCount;
+                    pass.hasStencil = cmd.dynamicPass.hasStencil;
                 }
-                surf.stencil = toTex(cmd.dynamicPass.stencil);
-                surf.framebuffer = cmd.dynamicPass.origBuffer;
-                pass.surface = surf;
-                pass.scale = *cast(vec2*)&cmd.dynamicPass.scale;
-                pass.rotationZ = cmd.dynamicPass.rotationZ;
-                pass.origBuffer = cmd.dynamicPass.origBuffer;
-                pass.origViewport[] = cmd.dynamicPass.origViewport;
-                pass.autoScaled = cmd.dynamicPass.autoScaled;
                 oglEndDynamicComposite(pass);
+                if (dynDrawStack.length) {
+                    auto before = dynDrawStack[$-1];
+                    dynDrawStack.length = dynDrawStack.length - 1;
+                    dynDepth = cast(int)dynDrawStack.length;
+                    writeln("[renderCommands] endDyn drawsAdded=", cast(int)drawCount - before);
+                }
                 break;
             }
             default:

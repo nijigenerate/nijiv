@@ -121,20 +121,22 @@ void oglDrawPartPacket(ref PartDrawPacket packet) {
 
 void oglExecutePartPacket(ref PartDrawPacket packet) {
     auto textures = packet.textures;
-    if (textures.length == 0 || textures[0] is null || textures[0].backendHandle() is null) return;
+    if (textures.length == 0) return;
 
     incDrawableBindVAO();
 
-    // Always make sure texture units 0..2 are explicitly bound each draw.
-    foreach(i; 0 .. 3) {
-        glActiveTexture(GL_TEXTURE0 + cast(uint)i);
-        if (i < textures.length && textures[i] !is null) {
-            textures[i].bind(cast(uint)i);
-        } else {
-            glBindTexture(GL_TEXTURE_2D, 0);
+    // Bind only when先頭テクスチャが変わった場合（nijiliveと同じキャッシュ方式）
+    if (boundAlbedo !is textures[0]) {
+        foreach (i, ref tex; textures) {
+            if (tex !is null) {
+                tex.bind(cast(uint)i);
+            } else {
+                glActiveTexture(GL_TEXTURE0 + cast(uint)i);
+                glBindTexture(GL_TEXTURE_2D, 0);
+            }
         }
+        boundAlbedo = textures[0];
     }
-    boundAlbedo = textures[0];
 
     auto matrix = packet.modelMatrix;
     mat4 renderMatrix = packet.renderMatrix;
@@ -306,9 +308,36 @@ void oglExecutePartPacket(ref PartDrawPacket packet) {
 private void setupShaderStage(ref PartDrawPacket packet, int stage, mat4 matrix, mat4 renderMatrix) {
     mat4 mvpMatrix = renderMatrix * matrix;
 
+    // Some offscreen FBOs (DynamicComposite) expose only COLOR_ATTACHMENT0.
+    // Guard draw buffer selection to the attachments that actually exist on the
+    // currently bound draw framebuffer to avoid INVALID_OPERATION (1282) and
+    // the “no texture bound to slot” spam seen in RenderDoc.
+    auto setDrawBuffersSafe = (int desired) {
+        GLenum[3] bufs;
+        int count = 0;
+        auto addIfPresent = (GLenum att) {
+            GLint type = GL_NONE;
+            glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, att,
+                GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+            if (type != GL_NONE) {
+                bufs[count++] = att;
+            }
+        };
+        // Always try attachment0 first; if it is absent, fall back to backbuffer.
+        addIfPresent(GL_COLOR_ATTACHMENT0);
+        if (desired > 1) addIfPresent(GL_COLOR_ATTACHMENT1);
+        if (desired > 2) addIfPresent(GL_COLOR_ATTACHMENT2);
+        if (count == 0) {
+            glDrawBuffer(GL_BACK);
+        } else {
+            glDrawBuffers(count, bufs.ptr);
+        }
+        return count;
+    };
+
     switch (stage) {
         case 0:
-            glDrawBuffers(1, [GL_COLOR_ATTACHMENT0].ptr);
+            setDrawBuffersSafe(1);
 
             partShaderStage1.use();
             partShaderStage1.setUniform(gs1offset, packet.origin);
@@ -319,7 +348,7 @@ private void setupShaderStage(ref PartDrawPacket packet, int stage, mat4 matrix,
             inSetBlendMode(packet.blendingMode, false);
             break;
         case 1:
-            glDrawBuffers(2, [GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2].ptr);
+            setDrawBuffersSafe(2);
 
             partShaderStage2.use();
             partShaderStage2.setUniform(gs2offset, packet.origin);
@@ -331,7 +360,7 @@ private void setupShaderStage(ref PartDrawPacket packet, int stage, mat4 matrix,
             inSetBlendMode(packet.blendingMode, true);
             break;
         case 2:
-            glDrawBuffers(3, [GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2].ptr);
+            setDrawBuffersSafe(3);
 
             partShader.use();
             partShader.setUniform(offset, packet.origin);

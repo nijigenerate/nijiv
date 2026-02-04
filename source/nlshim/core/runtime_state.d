@@ -73,6 +73,9 @@ void inPushViewport(int width, int height) {
     inViewportWidth ~= width;
     inViewportHeight ~= height;
     inPushCamera();
+    import std.stdio : writeln;
+    writeln("[vp] push width=", width, " height=", height,
+            " camDepth=", inCamera.length);
 }
 
 /// Pop viewport if we have more than one entry.
@@ -82,6 +85,8 @@ void inPopViewport() {
         inViewportHeight.length = inViewportHeight.length - 1;
         inPopCamera();
     }
+    import std.stdio : writeln;
+    writeln("[vp] pop  camDepth=", inCamera.length);
 }
 
 /**

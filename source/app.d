@@ -196,7 +196,7 @@ void main(string[] args) {
     frameCfg.viewportHeight = glInit.drawableH;
     inSetViewport(glInit.drawableW, glInit.drawableH);
     oglResizeViewport(glInit.drawableW, glInit.drawableH);
-    float puppetScale = 0.25f;
+    float puppetScale = 0.12f;
 
     // Apply initial scale (default 0.25) so that the view starts zoomed out.
     auto initScaleRes = api.setPuppetScale(puppet, puppetScale, puppetScale);
@@ -233,7 +233,7 @@ void main(string[] args) {
                     // Scroll up to zoom in, down to zoom out. Use exponential step.
                     {
                         float step = 0.1f; // ~10% per notch
-                        float factor = cast(float)exp(step * ev.wheel.y);
+                        float factor = cast(float)exp(step * -ev.wheel.y);
                         puppetScale = clamp(puppetScale * factor, 0.1f, 10.0f);
                         auto res = api.setPuppetScale(puppet, puppetScale, puppetScale);
                         if (res != NjgResult.Ok) {

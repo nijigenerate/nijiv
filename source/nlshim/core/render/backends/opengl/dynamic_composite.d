@@ -38,6 +38,30 @@ private GLuint textureId(Texture texture) {
 }
 
 private {
+    void logFboState(string tag) {
+        GLint drawFbo;
+        GLint readFbo;
+        GLint[4] vp;
+        GLint[4] dbufs;
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFbo);
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFbo);
+        glGetIntegerv(GL_VIEWPORT, vp.ptr);
+        foreach (i; 0 .. 4) {
+            glGetIntegerv(GL_DRAW_BUFFER0 + i, &dbufs[i]);
+        }
+        auto status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        GLint err = glGetError();
+        import std.stdio : writefln;
+        writefln("[dc-log] %s drawFbo=%s readFbo=%s drawBufs=%s status=0x%x vp=%s err=%s",
+            tag, drawFbo, readFbo, dbufs, status, vp, err);
+    }
+
+    void logGlErr(string tag) {
+        GLint err = glGetError();
+        import std.stdio : writefln;
+        writefln("[dc-err] %s glError=%s", tag, err);
+    }
+
     version (NijiliveRenderProfiler) {
         GLuint compositeTimeQuery;
         bool compositeTimerInit;
@@ -63,16 +87,6 @@ void oglBeginDynamicComposite(DynamicCompositePass pass) {
         debug (NijiliveRenderProfiler) writefln("[nijilive] oglBeginDynamicComposite skip: surface=null");
         return;
     }
-    // Validate generated textures.
-    if (surface.textureCount == 0 || surface.textures[0] is null ||
-        surface.textures[0].width <= 0 || surface.textures[0].height <= 0) {
-        import std.stdio : writeln;
-        writeln("[dyncomp] abort: invalid surface texCount=", surface.textureCount,
-                " tex0=", surface.textures.length ? surface.textures[0] : null,
-                " size=", surface.textures.length && surface.textures[0] !is null ? surface.textures[0].width : 0,
-                "x", surface.textures.length && surface.textures[0] !is null ? surface.textures[0].height : 0);
-        return;
-    }
     if (surface.textureCount == 0) {
         debug (NijiliveRenderProfiler) writefln("[nijilive] oglBeginDynamicComposite skip: textureCount=0");
         return;
@@ -90,12 +104,23 @@ void oglBeginDynamicComposite(DynamicCompositePass pass) {
     }
 
 
+    logFboState("pre-begin");
+    // Save current framebuffer/viewport so we can restore.
     GLint previousFramebuffer;
+    GLint previousReadFramebuffer;
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previousFramebuffer);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previousReadFramebuffer);
     pass.origBuffer = cast(RenderResourceHandle)previousFramebuffer;
     glGetIntegerv(GL_VIEWPORT, pass.origViewport.ptr);
+    // Save draw buffer count (fallback to 3 when unknown).
+    GLint maxDrawBuffers = 0;
+    glGetIntegerv(GL_MAX_COLOR_ATTACHMENTS, &maxDrawBuffers);
+    GLint[8] drawBufs;
+    glGetIntegerv(GL_DRAW_BUFFER0, &drawBufs[0]); // read only first
+    pass.drawBufferCount = surface.textureCount > 0 ? cast(int)surface.textureCount : 1;
 
     glBindFramebuffer(GL_FRAMEBUFFER, cast(GLuint)surface.framebuffer);
+    logGlErr("bind offscreen FBO");
 
     GLuint[3] drawBuffers;
     size_t bufferCount;
@@ -123,6 +148,7 @@ void oglBeginDynamicComposite(DynamicCompositePass pass) {
 
     inPushViewport(tex.width, tex.height);
 
+    // Adjust camera so offscreen composite renders upright into the target texture.
     auto camera = inGetCamera();
     camera.scale = vec2(1, -1);
 
@@ -135,9 +161,11 @@ void oglBeginDynamicComposite(DynamicCompositePass pass) {
     inSetCamera(camera);
 
     glDrawBuffers(cast(int)bufferCount, drawBuffers.ptr);
+    logGlErr("drawBuffers offscreen");
     glViewport(0, 0, tex.width, tex.height);
     glClearColor(0, 0, 0, 0);
     glClear(GL_COLOR_BUFFER_BIT);
+    logGlErr("clear offscreen");
     glActiveTexture(GL_TEXTURE0);
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
     debug (NijiliveRenderProfiler) {
@@ -150,6 +178,7 @@ void oglBeginDynamicComposite(DynamicCompositePass pass) {
     writefln(beginMsg);
     }
 
+    logFboState("post-begin");
     version (NijiliveRenderProfiler) {
         if (!compositeCpuActive) {
             compositeCpuActive = true;
@@ -173,14 +202,28 @@ void oglEndDynamicComposite(DynamicCompositePass pass) {
         return;
     }
 
+    logFboState("pre-end");
     // Rebind active attachments (respecting any swaps that happened while rendering).
     oglRebindActiveTargets();
 
-    glBindFramebuffer(GL_FRAMEBUFFER, cast(GLuint)pass.origBuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, cast(GLuint)pass.origBuffer);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, cast(GLuint)pass.origBuffer);
     inPopViewport();
     glViewport(pass.origViewport[0], pass.origViewport[1],
         pass.origViewport[2], pass.origViewport[3]);
-    glDrawBuffers(3, [GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2].ptr);
+    if (pass.origBuffer != 0) {
+        int count = pass.drawBufferCount > 0 ? pass.drawBufferCount : 3;
+        GLuint[3] bufs = [GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2];
+        glDrawBuffers(count, bufs.ptr);
+    } else {
+        // Backbuffer: ensure both draw/read buffers restored.
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+        glReadBuffer(GL_BACK);
+        glDrawBuffer(GL_BACK);
+    }
+    logGlErr("restore draw buffers");
+    logFboState("post-end");
     debug (NijiliveRenderProfiler) {
     auto endMsg = format(
         "[nijilive] oglEndDynamicComposite restore origFbo=%s viewport=%s,%s,%s,%s autoScaled=%s",
