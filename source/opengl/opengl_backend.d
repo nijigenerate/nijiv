@@ -12,7 +12,6 @@ import nlshim.core.render.support : BlendMode;
 import nlshim.core.render.support : vec2, vec3, mat4;
 import nlshim.core.render.backends.opengl.handles : GLTextureHandle;
 import nlshim.core.render.backends : RenderResourceHandle, RenderTextureHandle, BackendEnum, RenderBackend;
-import nlshim.core.render.backends.opengl.composite : oglDrawCompositeQuad;
 
 // ==== Types mirrored from the Unity DLL ABI ====
 alias RendererHandle = void*;
@@ -331,11 +330,37 @@ __gshared GLint gThumbMvpLoc = -1;
 __gshared GLuint gThumbVao;
 __gshared GLuint gThumbQuadVbo;
 __gshared GLuint gThumbQuadEbo;
+struct IboKey {
+    size_t ptr;
+    size_t count;
+    bool opEquals(ref const IboKey other) const nothrow @safe {
+        return ptr == other.ptr && count == other.count;
+    }
+    size_t toHash() const nothrow @safe {
+        // simple pointer/count mix; sufficient for stable indices buffers
+        return (ptr ^ (count + 0x9e3779b97f4a7c15UL + (ptr << 6) + (ptr >> 2)));
+    }
+}
+__gshared RenderResourceHandle[IboKey] gIboCache;
 
 /// Lookup Texture created via callbacks.
 Texture toTex(size_t h) {
     auto tex = h in gTextures;
     return tex is null ? null : *tex;
+}
+
+RenderResourceHandle getOrCreateIbo(const(ushort)* indices, size_t count) {
+    if (indices is null || count == 0) return RenderResourceHandle.init;
+    IboKey key = IboKey(cast(size_t)indices, count);
+    if (auto existing = key in gIboCache) {
+        return *existing;
+    }
+    RenderResourceHandle ibo;
+    oglCreateDrawableBuffers(ibo);
+    auto idxSlice = indices[0 .. count];
+    oglUploadDrawableIndices(ibo, idxSlice.dup);
+    gIboCache[key] = ibo;
+    return ibo;
 }
 
 void ensureSharedBuffers() {
@@ -864,11 +889,7 @@ void renderCommands(const OpenGLBackendInit* gl,
                 p.blendingMode = cast(BlendMode)cmd.partPacket.blendingMode;
                 p.useMultistageBlend = cmd.partPacket.useMultistageBlend;
                 p.hasEmissionOrBumpmap = cmd.partPacket.hasEmissionOrBumpmap;
-                RenderResourceHandle ibo;
-                oglCreateDrawableBuffers(ibo);
-                auto idxSlice = cmd.partPacket.indices[0 .. cmd.partPacket.indexCount];
-                oglUploadDrawableIndices(ibo, idxSlice.dup);
-                p.indexBuffer = ibo;
+                p.indexBuffer = getOrCreateIbo(cmd.partPacket.indices, cmd.partPacket.indexCount);
                 oglExecutePartPacket(p);
                 debug {
                     import std.stdio : writefln;
@@ -929,11 +950,7 @@ void renderCommands(const OpenGLBackendInit* gl,
                 p.blendingMode = cast(BlendMode)src.blendingMode;
                 p.useMultistageBlend = src.useMultistageBlend;
                 p.hasEmissionOrBumpmap = src.hasEmissionOrBumpmap;
-                RenderResourceHandle partIbo;
-                oglCreateDrawableBuffers(partIbo);
-                auto pIdx = src.indices[0 .. src.indexCount];
-                oglUploadDrawableIndices(partIbo, pIdx.dup);
-                p.indexBuffer = partIbo;
+                p.indexBuffer = getOrCreateIbo(src.indices, src.indexCount);
                 mp.partPacket = p;
 
                 MaskDrawPacket m;
@@ -947,11 +964,7 @@ void renderCommands(const OpenGLBackendInit* gl,
                 m.deformAtlasStride = ms.deformAtlasStride;
                 m.indexCount = cast(uint)ms.indexCount;
                 m.vertexCount = cast(uint)ms.vertexCount;
-                RenderResourceHandle maskIbo;
-                oglCreateDrawableBuffers(maskIbo);
-                auto mIdx = ms.indices[0 .. ms.indexCount];
-                oglUploadDrawableIndices(maskIbo, mIdx.dup);
-                m.indexBuffer = maskIbo;
+                m.indexBuffer = getOrCreateIbo(ms.indices, ms.indexCount);
 
                 mp.maskPacket = m;
                 mp.kind = cast(NlMaskKind)cmd.maskApplyPacket.kind;

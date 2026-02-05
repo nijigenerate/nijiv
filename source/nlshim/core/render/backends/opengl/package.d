@@ -72,7 +72,6 @@ import nlshim.core.render.backends.opengl.blend :
     oglSupportsAdvancedBlendCoherent,
     oglGetBlendShader,
     oglBlendToBuffer;
-import nlshim.core.render.backends.opengl.composite : oglDrawCompositeQuad;
 import nlshim.core.texture_types : Filtering, Wrapping;
 import nlshim.core.render.profiler : profileScope, renderProfilerFrameCompleted;
 import nlshim.core.render.backends.opengl.shader_backend :
