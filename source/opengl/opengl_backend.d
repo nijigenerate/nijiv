@@ -1278,7 +1278,7 @@ private __gshared Shader[BlendMode] blendShaders;
 private void ensureBlendShadersInitialized() {
     if (blendShaders.length > 0) return;
 
-    auto advancedBlendShader = new Shader(shaderAsset!("opengl/basic/basic.vert","opengl/basic/advanced_blend.frag")());
+    auto advancedBlendShader = new Shader(shaderAsset!("opengl/shaders/opengl/basic/basic.vert","opengl/shaders/opengl/basic/advanced_blend.frag")());
     BlendMode[] advancedModes = [
         BlendMode.Multiply,
         BlendMode.Screen,
@@ -1478,8 +1478,8 @@ import bindbc.opengl;
 
 private Shader lineShader;
 private Shader pointShader;
-enum ShaderAsset LineShaderSource = shaderAsset!("opengl/dbg.vert","opengl/dbgline.frag")();
-enum ShaderAsset PointShaderSource = shaderAsset!("opengl/dbg.vert","opengl/dbgpoint.frag")();
+enum ShaderAsset LineShaderSource = shaderAsset!("opengl/shaders/opengl/dbg.vert","opengl/shaders/opengl/dbgline.frag")();
+enum ShaderAsset PointShaderSource = shaderAsset!("opengl/shaders/opengl/dbg.vert","opengl/shaders/opengl/dbgpoint.frag")();
 private GLuint vao;
 private GLuint vbo;
 private GLuint ibo;
@@ -2092,7 +2092,7 @@ version (InDoesRender) {
 import bindbc.opengl;
 
 private __gshared Shader maskShader;
-enum ShaderAsset MaskShaderSource = shaderAsset!("opengl/mask.vert","opengl/mask.frag")();
+enum ShaderAsset MaskShaderSource = shaderAsset!("opengl/shaders/opengl/mask.vert","opengl/shaders/opengl/mask.frag")();
 private __gshared GLint maskOffsetUniform;
 private __gshared GLint maskMvpUniform;
 private __gshared bool maskBackendInitialized = false;
@@ -2578,10 +2578,10 @@ __gshared Texture boundAlbedo;
     __gshared GLint mthreshold;
 __gshared bool partBackendInitialized = false;
 
-enum ShaderAsset PartShaderSource = shaderAsset!("opengl/basic/basic.vert","opengl/basic/basic.frag")();
-enum ShaderAsset PartShaderStage1Source = shaderAsset!("opengl/basic/basic.vert","opengl/basic/basic-stage1.frag")();
-enum ShaderAsset PartShaderStage2Source = shaderAsset!("opengl/basic/basic.vert","opengl/basic/basic-stage2.frag")();
-enum ShaderAsset PartMaskShaderSource = shaderAsset!("opengl/basic/basic.vert","opengl/basic/basic-mask.frag")();
+enum ShaderAsset PartShaderSource = shaderAsset!("opengl/shaders/opengl/basic/basic.vert","opengl/shaders/opengl/basic/basic.frag")();
+enum ShaderAsset PartShaderStage1Source = shaderAsset!("opengl/shaders/opengl/basic/basic.vert","opengl/shaders/opengl/basic/basic-stage1.frag")();
+enum ShaderAsset PartShaderStage2Source = shaderAsset!("opengl/shaders/opengl/basic/basic.vert","opengl/shaders/opengl/basic/basic-stage2.frag")();
+enum ShaderAsset PartMaskShaderSource = shaderAsset!("opengl/shaders/opengl/basic/basic.vert","opengl/shaders/opengl/basic/basic-mask.frag")();
 }
 
 void oglInitPartBackendResources() {
@@ -3075,8 +3075,8 @@ private {
     PostProcessingShader basicSceneShader;
     PostProcessingShader basicSceneLighting;
     PostProcessingShader[] postProcessingStack;
-    enum ShaderAsset SceneShaderSource = shaderAsset!("opengl/scene.vert","opengl/scene.frag")();
-    enum ShaderAsset LightingShaderSource = shaderAsset!("opengl/scene.vert","opengl/lighting.frag")();
+    enum ShaderAsset SceneShaderSource = shaderAsset!("opengl/shaders/opengl/scene.vert","opengl/shaders/opengl/scene.frag")();
+    enum ShaderAsset LightingShaderSource = shaderAsset!("opengl/shaders/opengl/scene.vert","opengl/shaders/opengl/lighting.frag")();
 
     bool isCompositing;
     struct CompositeFrameState {

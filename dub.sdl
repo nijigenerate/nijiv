@@ -11,6 +11,7 @@ dependency "fghj" version="~>1.0.2"
 dependency "inmath" version="1.0.6"
 dependency "imagefmt" version="~>2.1.0"
 stringImportPaths "source/shaders/"
+stringImportPaths "source"
 versions "InDoesRender"
 
 versions "SDL_206" "GL_32"
