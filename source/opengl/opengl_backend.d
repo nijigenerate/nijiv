@@ -143,10 +143,6 @@ struct OpenGLBackendInit {
 
 alias NlMaskKind = MaskDrawableKind;
 
-// placeholder types for difference evaluation (merged)
-struct DifferenceEvaluationRegion {}
-struct DifferenceEvaluationResult {}
-
 __gshared Texture[size_t] gTextures; // Unity handle -> nlshim Texture
 __gshared size_t gNextHandle = 1;
 __gshared bool gBackendInitialized;
@@ -288,37 +284,10 @@ __gshared GLint gThumbMvpLoc = -1;
 __gshared GLuint gThumbVao;
 __gshared GLuint gThumbQuadVbo;
 __gshared GLuint gThumbQuadEbo;
-struct IboKey {
-    size_t ptr;
-    size_t count;
-    bool opEquals(ref const IboKey other) const nothrow @safe {
-        return ptr == other.ptr && count == other.count;
-    }
-    size_t toHash() const nothrow @safe {
-        // simple pointer/count mix; sufficient for stable indices buffers
-        return (ptr ^ (count + 0x9e3779b97f4a7c15UL + (ptr << 6) + (ptr >> 2)));
-    }
-}
-__gshared RenderResourceHandle[IboKey] gIboCache;
-
 /// Lookup Texture created via callbacks.
 Texture toTex(size_t h) {
     auto tex = h in gTextures;
     return tex is null ? null : *tex;
-}
-
-RenderResourceHandle getOrCreateIbo(const(ushort)* indices, size_t count) {
-    if (indices is null || count == 0) return RenderResourceHandle.init;
-    IboKey key = IboKey(cast(size_t)indices, count);
-    if (auto existing = key in gIboCache) {
-        return *existing;
-    }
-    RenderResourceHandle ibo;
-    currentRenderBackend().createDrawableBuffers(ibo);
-    auto idxSlice = indices[0 .. count];
-    currentRenderBackend().uploadDrawableIndices(ibo, idxSlice.dup);
-    gIboCache[key] = ibo;
-    return ibo;
 }
 
 void ensureThumbVao() {
@@ -572,7 +541,7 @@ void renderCommands(const OpenGLBackendInit* gl,
     // Core profileはVAO必須。nlshim側の属性設定を活かすため共通VAOをバインド。
     backend.bindDrawableVao();
     // 念のため最初にパート用シェーダをバインドしておく（prog=0防止）。
-    partShader.use();
+    backend.bindPartShader();
     debug {
         import std.stdio : writefln;
         GLint vao=0, prog=0;
@@ -615,7 +584,7 @@ void renderCommands(const OpenGLBackendInit* gl,
                 p.blendingMode = cast(BlendMode)cmd.partPacket.blendingMode;
                 p.useMultistageBlend = cmd.partPacket.useMultistageBlend;
                 p.hasEmissionOrBumpmap = cmd.partPacket.hasEmissionOrBumpmap;
-                p.indexBuffer = getOrCreateIbo(cmd.partPacket.indices, cmd.partPacket.indexCount);
+                p.indexBuffer = backend.getOrCreateIbo(cmd.partPacket.indices, cmd.partPacket.indexCount);
                 backend.drawPartPacket(p);
                 debug {
                     import std.stdio : writefln;
@@ -676,7 +645,7 @@ void renderCommands(const OpenGLBackendInit* gl,
                 p.blendingMode = cast(BlendMode)src.blendingMode;
                 p.useMultistageBlend = src.useMultistageBlend;
                 p.hasEmissionOrBumpmap = src.hasEmissionOrBumpmap;
-                p.indexBuffer = getOrCreateIbo(src.indices, src.indexCount);
+                p.indexBuffer = backend.getOrCreateIbo(src.indices, src.indexCount);
                 mp.partPacket = p;
 
                 MaskDrawPacket m;
@@ -690,7 +659,7 @@ void renderCommands(const OpenGLBackendInit* gl,
                 m.deformAtlasStride = ms.deformAtlasStride;
                 m.indexCount = cast(uint)ms.indexCount;
                 m.vertexCount = cast(uint)ms.vertexCount;
-                m.indexBuffer = getOrCreateIbo(ms.indices, ms.indexCount);
+                m.indexBuffer = backend.getOrCreateIbo(ms.indices, ms.indexCount);
 
                 mp.maskPacket = m;
                 mp.kind = cast(NlMaskKind)cmd.maskApplyPacket.kind;
@@ -902,46 +871,6 @@ void renderCommands(const OpenGLBackendInit* gl,
 
 //import std.stdio;
 
-/**
-    UDA for sub-classable parts of the spec
-    eg. Nodes and Automation can be extended by
-    adding new subclasses that aren't in the base spec.
-*/
-struct TypeId { string id; }
-
-/**
-    Different modes of interpolation between values.
-*/
-enum InterpolateMode {
-
-    /**
-        Round to nearest
-    */
-    Nearest,
-    
-    /**
-        Linear interpolation
-    */
-    Linear,
-
-    /**
-        Round to nearest
-    */
-    Stepped,
-
-    /**
-        Cubic interpolation
-    */
-    Cubic,
-
-    /**
-        Interpolation using beziér splines
-    */
-    Bezier,
-
-    COUNT
-}
-
 // ---- source/nlshim/core/render/backends/opengl/blend.d ----
 
 
@@ -949,30 +878,6 @@ enum InterpolateMode {
 
 import bindbc.opengl;
 import bindbc.opengl.context;
-
-private __gshared Shader[BlendMode] blendShaders;
-
-private void ensureBlendShadersInitialized() {
-    if (blendShaders.length > 0) return;
-
-    auto advancedBlendShader = new Shader(shaderAsset!("opengl/shaders/opengl/basic/basic.vert","opengl/shaders/opengl/basic/advanced_blend.frag")());
-    BlendMode[] advancedModes = [
-        BlendMode.Multiply,
-        BlendMode.Screen,
-        BlendMode.Overlay,
-        BlendMode.Darken,
-        BlendMode.Lighten,
-        BlendMode.ColorDodge,
-        BlendMode.ColorBurn,
-        BlendMode.HardLight,
-        BlendMode.SoftLight,
-        BlendMode.Difference,
-        BlendMode.Exclusion
-    ];
-    foreach (mode; advancedModes) {
-        blendShaders[mode] = advancedBlendShader;
-    }
-}
 
 void markBufferInUse(uint /*buffer*/) {}
 
@@ -990,8 +895,6 @@ private GLuint vbo;
 private GLuint ibo;
 private GLuint currentVbo;
 private int indexCount;
-private __gshared int pointCount;
-private __gshared bool bufferIsSoA;
 
 private void ensureInitialized() {
     if (vao != 0) return;
@@ -1014,48 +917,6 @@ private void ensureInitialized() {
 
 import bindbc.opengl;
 
-private __gshared GLuint drawableVAO;
-private __gshared bool drawableBuffersInitialized = false;
-private __gshared GLuint sharedDeformBuffer;
-private __gshared GLuint sharedVertexBuffer;
-private __gshared GLuint sharedUvBuffer;
-private __gshared GLuint sharedIndexBuffer;
-private __gshared size_t sharedIndexCapacity;
-private __gshared size_t sharedIndexOffset;
-private __gshared RenderResourceHandle nextIndexHandle = 1;
-
-private struct IndexRange {
-    size_t offset;
-    size_t count;
-    size_t capacity;
-    ushort[] data;
-}
-private __gshared IndexRange[RenderResourceHandle] sharedIndexRanges;
-
-private void ensureSharedIndexBuffer(size_t bytes) {
-    if (sharedIndexBuffer == 0) {
-        glGenBuffers(1, &sharedIndexBuffer);
-        sharedIndexCapacity = 0;
-        sharedIndexOffset = 0;
-    }
-    if (bytes > sharedIndexCapacity) {
-        size_t newCap = sharedIndexCapacity == 0 ? 1024 : sharedIndexCapacity;
-        while (newCap < bytes) newCap *= 2;
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, sharedIndexBuffer);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, newCap, null, GL_DYNAMIC_DRAW);
-        sharedIndexCapacity = newCap;
-        sharedIndexOffset = 0;
-        foreach (key, ref entry; sharedIndexRanges) {
-            if (entry.data.length == 0) continue;
-            auto entryBytes = cast(size_t)entry.data.length * ushort.sizeof;
-            entry.offset = sharedIndexOffset;
-            entry.count = entry.data.length;
-            entry.capacity = entryBytes;
-            glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, cast(GLintptr)entry.offset, entryBytes, entry.data.ptr);
-            sharedIndexOffset += entryBytes;
-        }
-    }
-}
 // ---- source/nlshim/core/render/backends/opengl/dynamic_composite.d ----
 
 
@@ -1127,20 +988,14 @@ GLTextureHandle requireGLTexture(RenderTextureHandle handle) {
 
 import bindbc.opengl;
 
-private __gshared Shader maskShader;
-enum ShaderAsset MaskShaderSource = shaderAsset!("opengl/shaders/opengl/mask.vert","opengl/shaders/opengl/mask.frag")();
-private __gshared GLint maskOffsetUniform;
-private __gshared GLint maskMvpUniform;
-private __gshared bool maskBackendInitialized = false;
-
-private void ensureMaskBackendInitialized() {
-    if (maskBackendInitialized) return;
-    maskBackendInitialized = true;
-
-    maskShader = new Shader(MaskShaderSource);
-    maskOffsetUniform = maskShader.getUniformLocation("offset");
-    maskMvpUniform = maskShader.getUniformLocation("mvp");
-}
+// ---- Shader Asset Definitions (centralized) ----
+private enum ShaderAsset MaskShaderSource = shaderAsset!("opengl/shaders/opengl/mask.vert","opengl/shaders/opengl/mask.frag")();
+private enum ShaderAsset AdvancedBlendShaderSource = shaderAsset!("opengl/shaders/opengl/basic/basic.vert","opengl/shaders/opengl/basic/advanced_blend.frag")();
+private enum ShaderAsset PartShaderSource = shaderAsset!("opengl/shaders/opengl/basic/basic.vert","opengl/shaders/opengl/basic/basic.frag")();
+private enum ShaderAsset PartShaderStage1Source = shaderAsset!("opengl/shaders/opengl/basic/basic.vert","opengl/shaders/opengl/basic/basic-stage1.frag")();
+private enum ShaderAsset PartShaderStage2Source = shaderAsset!("opengl/shaders/opengl/basic/basic.vert","opengl/shaders/opengl/basic/basic-stage2.frag")();
+private enum ShaderAsset PartMaskShaderSource = shaderAsset!("opengl/shaders/opengl/basic/basic.vert","opengl/shaders/opengl/basic/basic-mask.frag")();
+private enum ShaderAsset LightingShaderSource = shaderAsset!("opengl/shaders/opengl/scene.vert","opengl/shaders/opengl/lighting.frag")();
 
 /// Prepare stencil for mask rendering.
 /// useStencil == true when there is at least one normal mask (write 1 to masked area).
@@ -1157,12 +1012,210 @@ private void ensureMaskBackendInitialized() {
 import inmath.linalg : rect;
 
 class RenderingBackend(BackendEnum backendType : BackendEnum.OpenGL) {
+    private struct IboKey {
+        size_t ptr;
+        size_t count;
+        bool opEquals(ref const IboKey other) const nothrow @safe {
+            return ptr == other.ptr && count == other.count;
+        }
+        size_t toHash() const nothrow @safe {
+            // simple pointer/count mix; sufficient for stable index buffers
+            return (ptr ^ (count + 0x9e3779b97f4a7c15UL + (ptr << 6) + (ptr >> 2)));
+        }
+    }
+
+    private struct IndexRange {
+        size_t offset;
+        size_t count;
+        size_t capacity;
+        ushort[] data;
+    }
+
+    private SharedVecAtlas deformAtlas;
+    private SharedVecAtlas vertexAtlas;
+    private SharedVecAtlas uvAtlas;
+
+    private Shader[BlendMode] blendShaders;
+    private int pointCount;
+    private bool bufferIsSoA;
+
+    private GLuint drawableVAO;
+    private bool drawableBuffersInitialized = false;
+    private GLuint sharedDeformBuffer;
+    private GLuint sharedVertexBuffer;
+    private GLuint sharedUvBuffer;
+    private GLuint sharedIndexBuffer;
+    private size_t sharedIndexCapacity;
+    private size_t sharedIndexOffset;
+    private RenderResourceHandle nextIndexHandle = 1;
+    private IndexRange[RenderResourceHandle] sharedIndexRanges;
+
+    private Shader maskShader;
+    private GLint maskOffsetUniform;
+    private GLint maskMvpUniform;
+    private bool maskBackendInitialized = false;
+
+    private Texture boundAlbedo;
+    private Shader partShader;
+    private Shader partShaderStage1;
+    private Shader partShaderStage2;
+    private Shader partMaskShader;
+    private GLint mvp;
+    private GLint offset;
+    private GLint gopacity;
+    private GLint gMultColor;
+    private GLint gScreenColor;
+    private GLint gEmissionStrength;
+    private GLint gs1mvp;
+    private GLint gs1offset;
+    private GLint gs1opacity;
+    private GLint gs1MultColor;
+    private GLint gs1ScreenColor;
+    private GLint gs2mvp;
+    private GLint gs2offset;
+    private GLint gs2opacity;
+    private GLint gs2EmissionStrength;
+    private GLint gs2MultColor;
+    private GLint gs2ScreenColor;
+    private GLint mmvp;
+    private GLint mthreshold;
+    private bool partBackendInitialized = false;
+
+    private GLuint sceneVAO;
+    private GLuint sceneVBO;
+
+    private GLuint fBuffer;
+    private GLuint fAlbedo;
+    private GLuint fEmissive;
+    private GLuint fBump;
+    private GLuint fStencil;
+
+    private GLuint cfBuffer;
+    private GLuint cfAlbedo;
+    private GLuint cfEmissive;
+    private GLuint cfBump;
+    private GLuint cfStencil;
+
+    private GLuint blendFBO;
+    private GLuint blendAlbedo;
+    private GLuint blendEmissive;
+    private GLuint blendBump;
+    private GLuint blendStencil;
+
+    private PostProcessingShader[] postProcessingStack;
+
+    private RenderResourceHandle[IboKey] iboCache;
+
+    private void ensureBlendShadersInitialized() {
+        if (blendShaders.length > 0) return;
+
+        auto advancedBlendShader = new Shader(AdvancedBlendShaderSource);
+        BlendMode[] advancedModes = [
+            BlendMode.Multiply,
+            BlendMode.Screen,
+            BlendMode.Overlay,
+            BlendMode.Darken,
+            BlendMode.Lighten,
+            BlendMode.ColorDodge,
+            BlendMode.ColorBurn,
+            BlendMode.HardLight,
+            BlendMode.SoftLight,
+            BlendMode.Difference,
+            BlendMode.Exclusion
+        ];
+        foreach (mode; advancedModes) {
+            blendShaders[mode] = advancedBlendShader;
+        }
+    }
+
+    private void ensureMaskBackendInitialized() {
+        if (maskBackendInitialized) return;
+        maskBackendInitialized = true;
+
+        maskShader = new Shader(MaskShaderSource);
+        maskOffsetUniform = maskShader.getUniformLocation("offset");
+        maskMvpUniform = maskShader.getUniformLocation("mvp");
+    }
+
+    private void ensureSharedIndexBuffer(size_t bytes) {
+        if (sharedIndexBuffer == 0) {
+            glGenBuffers(1, &sharedIndexBuffer);
+            sharedIndexCapacity = 0;
+            sharedIndexOffset = 0;
+        }
+        if (bytes > sharedIndexCapacity) {
+            size_t newCap = sharedIndexCapacity == 0 ? 1024 : sharedIndexCapacity;
+            while (newCap < bytes) newCap *= 2;
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, sharedIndexBuffer);
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, newCap, null, GL_DYNAMIC_DRAW);
+            sharedIndexCapacity = newCap;
+            sharedIndexOffset = 0;
+            foreach (key, ref entry; sharedIndexRanges) {
+                if (entry.data.length == 0) continue;
+                auto entryBytes = cast(size_t)entry.data.length * ushort.sizeof;
+                entry.offset = sharedIndexOffset;
+                entry.count = entry.data.length;
+                entry.capacity = entryBytes;
+                glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, cast(GLintptr)entry.offset, entryBytes, entry.data.ptr);
+                sharedIndexOffset += entryBytes;
+            }
+        }
+    }
+
+    private void renderScene(vec4 area, PostProcessingShader shaderToUse, GLuint albedo, GLuint emissive, GLuint bump) {
+        glViewport(0, 0, cast(int)area.z, cast(int)area.w);
+
+        glBindVertexArray(sceneVAO);
+
+        glDisable(GL_CULL_FACE);
+        glDisable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendEquation(GL_FUNC_ADD);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+
+        shaderToUse.shader.use();
+        shaderToUse.shader.setUniform(shaderToUse.getUniform("mvp"),
+            mat4.orthographic(0, area.z, area.w, 0, 0, max(area.z, area.w)) *
+            mat4.translation(area.x, area.y, 0)
+        );
+
+        GLint ambientLightUniform = shaderToUse.getUniform("ambientLight");
+        if (ambientLightUniform != -1) shaderToUse.shader.setUniform(ambientLightUniform, inSceneAmbientLight);
+
+        GLint fbSizeUniform = shaderToUse.getUniform("fbSize");
+        if (fbSizeUniform != -1) shaderToUse.shader.setUniform(fbSizeUniform, vec2(inViewportWidth[$-1], inViewportHeight[$-1]));
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, albedo);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, emissive);
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, bump);
+
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4*float.sizeof, null);
+
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4*float.sizeof, cast(float*)(2*float.sizeof));
+
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+
+        glDisableVertexAttribArray(0);
+        glDisableVertexAttribArray(1);
+
+        glDisable(GL_BLEND);
+    }
+
+    void bindPartShader() {
+        if (partShader !is null) {
+            partShader.use();
+        }
+    }
+
     void initializeRenderer() {
         // Set the viewport and by extension set the textures
         inSetViewport(640, 480);
 
-        // Shader for scene
-        basicSceneShader = PostProcessingShader(new Shader(SceneShaderSource));
         glGenVertexArrays(1, &sceneVAO);
         glGenBuffers(1, &sceneVBO);
 
@@ -1389,6 +1442,20 @@ class RenderingBackend(BackendEnum backendType : BackendEnum.OpenGL) {
         sharedIndexRanges[ibo] = range;
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, sharedIndexBuffer);
         glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, cast(GLintptr)range.offset, bytes, indices.ptr);
+    }
+
+    RenderResourceHandle getOrCreateIbo(const(ushort)* indices, size_t count) {
+        if (indices is null || count == 0) return RenderResourceHandle.init;
+        IboKey key = IboKey(cast(size_t)indices, count);
+        if (auto existing = key in iboCache) {
+            return *existing;
+        }
+        RenderResourceHandle ibo;
+        createDrawableBuffers(ibo);
+        auto idxSlice = indices[0 .. count];
+        uploadDrawableIndices(ibo, idxSlice.dup);
+        iboCache[key] = ibo;
+        return ibo;
     }
 
     void rebindActiveTargets() {
@@ -2439,38 +2506,6 @@ private:
 
 import bindbc.opengl;
 import std.algorithm : min;
-public {
-__gshared Texture boundAlbedo;
-    __gshared Shader partShader;
-    __gshared Shader partShaderStage1;
-    __gshared Shader partShaderStage2;
-    __gshared Shader partMaskShader;
-    __gshared GLint mvp;
-    __gshared GLint offset;
-    __gshared GLint gopacity;
-    __gshared GLint gMultColor;
-    __gshared GLint gScreenColor;
-    __gshared GLint gEmissionStrength;
-    __gshared GLint gs1mvp;
-    __gshared GLint gs1offset;
-    __gshared GLint gs1opacity;
-    __gshared GLint gs1MultColor;
-    __gshared GLint gs1ScreenColor;
-    __gshared GLint gs2mvp;
-    __gshared GLint gs2offset;
-    __gshared GLint gs2opacity;
-    __gshared GLint gs2EmissionStrength;
-    __gshared GLint gs2MultColor;
-    __gshared GLint gs2ScreenColor;
-    __gshared GLint mmvp;
-    __gshared GLint mthreshold;
-__gshared bool partBackendInitialized = false;
-
-enum ShaderAsset PartShaderSource = shaderAsset!("opengl/shaders/opengl/basic/basic.vert","opengl/shaders/opengl/basic/basic.frag")();
-enum ShaderAsset PartShaderStage1Source = shaderAsset!("opengl/shaders/opengl/basic/basic.vert","opengl/shaders/opengl/basic/basic-stage1.frag")();
-enum ShaderAsset PartShaderStage2Source = shaderAsset!("opengl/shaders/opengl/basic/basic.vert","opengl/shaders/opengl/basic/basic-stage2.frag")();
-enum ShaderAsset PartMaskShaderSource = shaderAsset!("opengl/shaders/opengl/basic/basic.vert","opengl/shaders/opengl/basic/basic-mask.frag")();
-}
 
 // ---- source/nlshim/core/render/backends/opengl/runtime.d ----
 
@@ -2517,95 +2552,6 @@ public:
     */
     bool hasUniform(string name) {
         return (name in uniformCache) !is null;
-    }
-}
-
-// Internal rendering constants
-private {
-    GLuint sceneVAO;
-    GLuint sceneVBO;
-
-    GLuint fBuffer;
-    GLuint fAlbedo;
-    GLuint fEmissive;
-    GLuint fBump;
-    GLuint fStencil;
-
-    GLuint cfBuffer;
-    GLuint cfAlbedo;
-    GLuint cfEmissive;
-    GLuint cfBump;
-    GLuint cfStencil;
-
-    GLuint blendFBO;
-    GLuint blendAlbedo;
-    GLuint blendEmissive;
-    GLuint blendBump;
-    GLuint blendStencil;
-
-    PostProcessingShader basicSceneShader;
-    PostProcessingShader basicSceneLighting;
-    PostProcessingShader[] postProcessingStack;
-    enum ShaderAsset SceneShaderSource = shaderAsset!("opengl/shaders/opengl/scene.vert","opengl/shaders/opengl/scene.frag")();
-    enum ShaderAsset LightingShaderSource = shaderAsset!("opengl/shaders/opengl/scene.vert","opengl/shaders/opengl/lighting.frag")();
-
-    bool isCompositing;
-    struct CompositeFrameState {
-        GLint framebuffer;
-        GLint[4] viewport;
-    }
-    CompositeFrameState[] compositeScopeStack;
-
-    void renderScene(vec4 area, PostProcessingShader shaderToUse, GLuint albedo, GLuint emissive, GLuint bump) {
-        glViewport(0, 0, cast(int)area.z, cast(int)area.w);
-
-        // Bind our vertex array
-        glBindVertexArray(sceneVAO);
-        
-        glDisable(GL_CULL_FACE);
-        glDisable(GL_DEPTH_TEST);
-        glEnable(GL_BLEND);
-        glBlendEquation(GL_FUNC_ADD);
-        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-
-        shaderToUse.shader.use();
-        shaderToUse.shader.setUniform(shaderToUse.getUniform("mvp"), 
-            mat4.orthographic(0, area.z, area.w, 0, 0, max(area.z, area.w)) * 
-            mat4.translation(area.x, area.y, 0)
-        );
-
-        // Ambient light
-        GLint ambientLightUniform = shaderToUse.getUniform("ambientLight");
-        if (ambientLightUniform != -1) shaderToUse.shader.setUniform(ambientLightUniform, inSceneAmbientLight);
-
-        // framebuffer size
-        GLint fbSizeUniform = shaderToUse.getUniform("fbSize");
-        if (fbSizeUniform != -1) shaderToUse.shader.setUniform(fbSizeUniform, vec2(inViewportWidth[$-1], inViewportHeight[$-1]));
-
-        // Bind the texture
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, albedo);
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, emissive);
-        glActiveTexture(GL_TEXTURE2);
-        glBindTexture(GL_TEXTURE_2D, bump);
-
-        // Enable points array
-        glEnableVertexAttribArray(0); // verts
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4*float.sizeof, null);
-
-        // Enable UVs array
-        glEnableVertexAttribArray(1); // uvs
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4*float.sizeof, cast(float*)(2*float.sizeof));
-
-        // Draw
-        glDrawArrays(GL_TRIANGLES, 0, 6);
-
-        // Disable the vertex attribs after use
-        glDisableVertexAttribArray(0);
-        glDisableVertexAttribArray(1);
-
-        glDisable(GL_BLEND);
     }
 }
 
@@ -2715,14 +2661,6 @@ import std.exception : enforce;
 
 /// Struct for backend-cached shared GPU state
 alias RenderResourceHandle = size_t;
-
-struct RenderGpuState {
-    RenderResourceHandle framebuffer;
-    RenderResourceHandle[8] drawBuffers;
-    ubyte drawBufferCount;
-    bool[4] colorMask;
-    bool blendEnabled;
-}
 
 /// Base type for backend-provided opaque handles.
 class RenderBackendHandle { }
@@ -2843,14 +2781,6 @@ struct MaskApplyPacket {
     MaskDrawPacket maskPacket;
 }
 
-struct CompositeDrawPacket {
-    bool valid;
-    float opacity;
-    vec3 tint;
-    vec3 screenTint;
-    BlendMode blendingMode;
-}
-
 class DynamicCompositeSurface {
     Texture[3] textures;
     size_t textureCount;
@@ -2875,13 +2805,6 @@ class DynamicCompositePass {
 enum RenderPassKind {
     Root,
     DynamicComposite,
-}
-
-/// Hint describing which render scope should receive emitted commands.
-struct RenderScopeHint {
-    RenderPassKind kind = RenderPassKind.Root;
-    size_t token;
-    bool skip;
 }
 
 // ---- source/nlshim/core/render/shared_deform_buffer.d ----
@@ -2966,18 +2889,11 @@ private:
     }
 }
 
-private __gshared {
-    SharedVecAtlas deformAtlas;
-    SharedVecAtlas vertexAtlas;
-    SharedVecAtlas uvAtlas;
-}
-
 // ---- source/nlshim/core/render/support.d ----
 
 import inmath.linalg : Vector;
 alias Vec2Array = veca!(float, 2);
 alias Vec3Array = veca!(float, 3);
-alias Vec4Array = veca!(float, 4);
 
 public enum BlendMode {
     Normal,
@@ -3090,13 +3006,6 @@ public void incDrawableBindVAO() {
 private bool doGenerateBounds = false;
 public void inSetUpdateBounds(bool state) { doGenerateBounds = state; }
 
-// Minimal placeholders to satisfy type references after core/nodes removal.
-class Drawable {}
-class Part : Drawable {}
-class Mask : Drawable {}
-class Projectable : Drawable {}
-class Composite : Projectable {}
-
 // ---- source/nlshim/core/runtime_state.d ----
 
 import fghj : deserializeValue;
@@ -3106,7 +3015,6 @@ import core.stdc.string : memcpy;
 public int[] inViewportWidth;
 public int[] inViewportHeight;
 public vec4 inClearColor = vec4(0, 0, 0, 0);
-public Camera[] inCamera;
 vec3 inSceneAmbientLight = vec3(1, 1, 1);
 
 private __gshared RenderBackend cachedRenderBackend;
@@ -3121,30 +3029,10 @@ public void inSetRenderBackend(RenderBackend backend) {
     cachedRenderBackend = backend;
 }
 
-/// Push a new default camera onto the stack.
-void inPushCamera() {
-    inPushCamera(new Camera);
-}
-
-/// Push a provided camera instance onto the stack.
-void inPushCamera(Camera camera) {
-    inCamera ~= camera;
-}
-
-/// Pop the most recent camera if we have more than one.
-void inPopCamera() {
-    if (inCamera.length > 1) {
-        inCamera.length = inCamera.length - 1;
-    }
-}
-/// Push viewport dimensions and sync camera stack.
+/// Push viewport dimensions.
 void inPushViewport(int width, int height) {
     inViewportWidth ~= width;
     inViewportHeight ~= height;
-    inPushCamera();
-    import std.stdio : writeln;
-    writeln("[vp] push width=", width, " height=", height,
-            " camDepth=", inCamera.length);
 }
 
 /// Pop viewport if we have more than one entry.
@@ -3152,10 +3040,7 @@ void inPopViewport() {
     if (inViewportWidth.length > 1) {
         inViewportWidth.length = inViewportWidth.length - 1;
         inViewportHeight.length = inViewportHeight.length - 1;
-        inPopCamera();
     }
-    import std.stdio : writeln;
-    writeln("[vp] pop  camDepth=", inCamera.length);
 }
 
 /**
@@ -3809,75 +3694,6 @@ enum Wrapping {
     Mirror,
 }
 
-// ---- source/nlshim/math/camera.d ----
-/*
-    nijilive Camera
-    previously Inochi2D Camera
-
-    Copyright © 2020, Inochi2D Project
-    Copyright © 2024, nijigenerate Project
-    Distributed under the 2-Clause BSD License, see LICENSE file.
-    
-    Authors: Luna Nielsen
-*/
-import std.math : isFinite;
-
-/**
-    An orthographic camera
-*/
-class Camera {
-private:
-    mat4 projection;
-
-public:
-
-    /**
-        Position of camera
-    */
-    vec2 position = vec2(0, 0);
-
-    /**
-        Rotation of the camera
-    */
-    float rotation = 0f;
-
-    /**
-        Size of the camera
-    */
-    vec2 scale = vec2(1, 1);
-
-    vec2 getRealSize() {
-        int width, height;
-        inGetViewport(width, height);
-
-        return vec2(cast(float)width/scale.x, cast(float)height/scale.y);
-    }
-
-    /**
-        Matrix for this camera
-
-        width = width of camera area
-        height = height of camera area
-    */
-    mat4 matrix() {
-        if(!position.isFinite) position = vec2(0);
-        if(!scale.isFinite) scale = vec2(1);
-        if(!rotation.isFinite) rotation = 0;
-
-        vec2 realSize = getRealSize();
-        if(!realSize.isFinite) return mat4.identity;
-        
-        vec2 origin = vec2(realSize.x/2, realSize.y/2);
-        vec3 pos = vec3(position.x, position.y, -(ushort.max/2));
-
-        return 
-            mat4.orthographic(0f, realSize.x, realSize.y, 0, 0, ushort.max) * 
-            mat4.translation(origin.x, origin.y, 0) *
-            mat4.zRotation(rotation) *
-            mat4.translation(pos);
-    }
-}
-
 // ---- source/nlshim/math/package.d ----
 /*
     nijilive Math helpers
@@ -4489,14 +4305,6 @@ struct vecvConst(T, size_t N) {
 }
 
 
-alias vec2v = vecv!(float, 2);
-alias vec3v = vecv!(float, 3);
-alias vec4v = vecv!(float, 4);
-
-alias vec2vConst = vecvConst!(float, 2);
-alias vec3vConst = vecvConst!(float, 3);
-alias vec4vConst = vecvConst!(float, 4);
-
 template VecArray(T, size_t N) {
     alias VecArray = veca!(T, N);
 }
@@ -4558,53 +4366,6 @@ if (isSIMDCompatible!T) {
         else
             dst[i] /= src[i];
     }
-}
-
-unittest {
-    alias Vec = veca!(float, 3);
-    Vec storage;
-    storage.ensureLength(2);
-    storage[0] = Vector!(float, 3)(1, 2, 3);
-    storage[1] = Vector!(float, 3)(4, 5, 6);
-
-    auto copy = storage.toArray();
-    assert(copy.length == 2);
-    assert(copy[0][0] == 1 && copy[1][2] == 6);
-
-    auto view = storage[0];
-    view.x += 2;
-    view.y = 10;
-    storage += storage;
-    assert(approxEqual(storage[0].x, (1 + 2) * 2));
-    assert(approxEqual(storage[1].z, 12));
-
-    Vector!(float, 3) vec = storage[0];
-    assert(vec[0] == storage[0].x);
-    vec[1] = 2;
-    storage[0] = vec;
-    assert(approxEqual(storage[0].y, 2));
-
-    storage ~= Vector!(float, 3)(7, 8, 9);
-    auto concatenated = storage ~ Vector!(float, 3)(0, 0, 0);
-    assert(concatenated.length == storage.length + 1);
-
-    float sumBefore;
-    foreach (ref elem; storage) {
-        sumBefore += elem.x;
-        elem.x += 1;
-    }
-    assert(sumBefore > 0);
-
-    auto dupe = storage.dup;
-    assert(dupe.length == storage.length);
-
-    auto rebuilt = vecaFromVectors!(float, 3)(storage.toArray());
-    assert(rebuilt.length == storage.length);
-
-    Vec2Array arr2;
-    arr2 ~= Vector!(float, 2)(1, 1);
-    arr2 ~= Vector!(float, 2)(2, 2);
-    assert(arr2.length == 2);
 }
 
 // ---- source/nlshim/math/veca_ops.d ----
@@ -4768,10 +4529,5 @@ package(opengl) void rotateVec2TangentsToNormals(
 
 // ---- source/nlshim/ver.d ----
 // AUTOGENERATED BY GITVER, DO NOT MODIFY
-
-/**
-	nijilive Version, autogenerated with gitver
-*/
-enum IN_VERSION = "v1.0.0-alpha1-40-g4f5ac7f";
 
 // trans rights
