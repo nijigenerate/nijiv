@@ -200,10 +200,10 @@ OpenGLBackendInit initOpenGLBackend(int width, int height, bool isTest) {
     if (!gBackendInitialized) {
         gBackendInitialized = true;
         // Initialize nlshim OpenGL resources to back the queue callbacks.
-        oglInitRenderer();
-        oglInitDrawableBackend();
-        oglInitPartBackendResources();
-        oglInitMaskBackend();
+        auto backend = currentRenderBackend();
+        backend.initializeRenderer();
+        backend.initializePartBackendResources();
+        backend.initializeMaskBackend();
     }
     // Keep viewport in sync with actual drawable size.
     currentRenderBackend().resizeViewportTargets(drawableW, drawableH);
@@ -314,9 +314,9 @@ RenderResourceHandle getOrCreateIbo(const(ushort)* indices, size_t count) {
         return *existing;
     }
     RenderResourceHandle ibo;
-    oglCreateDrawableBuffers(ibo);
+    currentRenderBackend().createDrawableBuffers(ibo);
     auto idxSlice = indices[0 .. count];
-    oglUploadDrawableIndices(ibo, idxSlice.dup);
+    currentRenderBackend().uploadDrawableIndices(ibo, idxSlice.dup);
     gIboCache[key] = ibo;
     return ibo;
 }
@@ -886,65 +886,6 @@ void renderCommands(const OpenGLBackendInit* gl,
 
 
 // ==== nlshim merged (pure copy, no edits) ====
-// ---- source/nlshim/core/dbg.d ----
-
-
-private bool debugInitialized;
-private bool hasDebugBuffer;
-
-private RenderBackend backendOrNull() {
-    return tryRenderBackend();
-}
-
-private RenderBackend backendForDebug() {
-    auto backend = backendOrNull();
-    if (backend is null) return null;
-    if (!debugInitialized) {
-        backend.initDebugRenderer();
-        debugInitialized = true;
-    }
-    return backend;
-}
-
-public void inInitDebug() {
-    backendForDebug();
-}
-
-bool inDbgDrawMeshOutlines = false;
-bool inDbgDrawMeshVertexPoints = false;
-bool inDbgDrawMeshOrientation = false;
-
-void inDbgSetBuffer(Vec3Array points) {
-    size_t vertexCount = points.length;
-    size_t indexCount = vertexCount == 0 ? 0 : vertexCount + 1;
-    ushort[] indices = new ushort[indexCount];
-    foreach (i; 0 .. vertexCount) {
-        indices[i] = cast(ushort)i;
-    }
-    if (indices.length) {
-        indices[$ - 1] = 0;
-    }
-    inDbgSetBuffer(points, indices);
-}
-
-void inDbgSetBuffer(RenderResourceHandle vbo, RenderResourceHandle ibo, int count) {
-    auto backend = backendForDebug();
-    if (backend is null) return;
-    backend.setDebugExternalBuffer(vbo, ibo, count);
-    hasDebugBuffer = count > 0;
-}
-
-void inDbgSetBuffer(Vec3Array points, ushort[] indices) {
-    if (points.length == 0 || indices.length == 0) {
-        hasDebugBuffer = false;
-        return;
-    }
-    auto backend = backendForDebug();
-    if (backend is null) return;
-    backend.uploadDebugBuffer(points, indices);
-    hasDebugBuffer = true;
-}
-
 // ---- source/nlshim/core/package.d ----
 /*
     nijilive Rendering
@@ -957,11 +898,7 @@ void inDbgSetBuffer(Vec3Array points, ushort[] indices) {
     Authors: Luna Nielsen
 */
 
-
-    version(UseQueueBackend) {
-    } else {
-        // OpenGL backend is provided by top-level opengl/* modules; avoid importing nlshim copies.
-    }
+// OpenGL backend is provided by top-level opengl/* modules; avoid importing nlshim copies.
 
 //import std.stdio;
 
@@ -1075,17 +1012,6 @@ private void ensureInitialized() {
 // ---- source/nlshim/core/render/backends/opengl/drawable_buffers.d ----
 
 
-version (unittest) {
-    alias GLuint = uint;
-
-    void oglInitDrawableBackend() {}
-    void oglCreateDrawableBuffers(ref RenderResourceHandle ibo) {
-        ibo = 0;
-    }
-    void oglUploadDrawableIndices(RenderResourceHandle, ushort[]) {}
-    void oglDrawDrawableElements(GLuint, size_t) {}
-} else version (InDoesRender):
-
 import bindbc.opengl;
 
 private __gshared GLuint drawableVAO;
@@ -1130,51 +1056,6 @@ private void ensureSharedIndexBuffer(size_t bytes) {
         }
     }
 }
-void oglInitDrawableBackend() {
-    if (drawableBuffersInitialized) return;
-    drawableBuffersInitialized = true;
-    glGenVertexArrays(1, &drawableVAO);
-}
-
-void oglCreateDrawableBuffers(ref RenderResourceHandle ibo) {
-    oglInitDrawableBackend();
-    if (ibo == 0) {
-        ibo = nextIndexHandle++;
-    }
-}
-
-void oglUploadDrawableIndices(RenderResourceHandle ibo, ushort[] indices) {
-    if (ibo == 0 || indices.length == 0) return;
-    auto bytes = cast(size_t)indices.length * ushort.sizeof;
-    ensureSharedIndexBuffer(bytes + sharedIndexOffset);
-
-    IndexRange range;
-    auto existing = ibo in sharedIndexRanges;
-    if (existing !is null) {
-        range = *existing;
-    }
-    if (existing is null || bytes > range.capacity) {
-        range.offset = sharedIndexOffset;
-        range.count = indices.length;
-        range.capacity = bytes;
-        sharedIndexOffset += bytes;
-    } else {
-        range.count = indices.length;
-    }
-    range.data = indices.dup;
-    sharedIndexRanges[ibo] = range;
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, sharedIndexBuffer);
-    glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, cast(GLintptr)range.offset, bytes, indices.ptr);
-}
-void oglDrawDrawableElements(RenderResourceHandle ibo, size_t indexCount) {
-    if (ibo == 0 || indexCount == 0) return;
-    auto rangePtr = ibo in sharedIndexRanges;
-    if (rangePtr is null || sharedIndexBuffer == 0) return;
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, sharedIndexBuffer);
-    auto offset = rangePtr.offset;
-    glDrawElements(GL_TRIANGLES, cast(int)indexCount, GL_UNSIGNED_SHORT, cast(void*)offset);
-}
-
 // ---- source/nlshim/core/render/backends/opengl/dynamic_composite.d ----
 
 
@@ -1261,10 +1142,6 @@ private void ensureMaskBackendInitialized() {
     maskMvpUniform = maskShader.getUniformLocation("mvp");
 }
 
-void oglInitMaskBackend() {
-    ensureMaskBackendInitialized();
-}
-
 /// Prepare stencil for mask rendering.
 /// useStencil == true when there is at least one normal mask (write 1 to masked area).
 /// useStencil == false when only dodge masks are present (keep stencil at 1 and punch 0 holes).
@@ -1280,6 +1157,121 @@ void oglInitMaskBackend() {
 import inmath.linalg : rect;
 
 class RenderingBackend(BackendEnum backendType : BackendEnum.OpenGL) {
+    void initializeRenderer() {
+        // Set the viewport and by extension set the textures
+        inSetViewport(640, 480);
+
+        // Shader for scene
+        basicSceneShader = PostProcessingShader(new Shader(SceneShaderSource));
+        glGenVertexArrays(1, &sceneVAO);
+        glGenBuffers(1, &sceneVBO);
+
+        import std.stdio : writeln;
+        writeln("[oglInitRenderer] sceneVAO=", sceneVAO, " sceneVBO=", sceneVBO);
+
+        // Generate the framebuffer we'll be using to render the model and composites
+        glGenFramebuffers(1, &fBuffer);
+        glGenFramebuffers(1, &cfBuffer);
+        glGenFramebuffers(1, &blendFBO);
+
+        // Generate the color and stencil-depth textures needed
+        // Note: we're not using the depth buffer but OpenGL 3.4 does not support stencil-only buffers
+        glGenTextures(1, &fAlbedo);
+        glGenTextures(1, &fEmissive);
+        glGenTextures(1, &fBump);
+        glGenTextures(1, &fStencil);
+
+        writeln("[oglInitRenderer] fAlbedo=", fAlbedo, " fEmissive=", fEmissive, " fBump=", fBump, " fStencil=", fStencil);
+
+        glGenTextures(1, &cfAlbedo);
+        glGenTextures(1, &cfEmissive);
+        glGenTextures(1, &cfBump);
+        glGenTextures(1, &cfStencil);
+
+        writeln("[oglInitRenderer] cfAlbedo=", cfAlbedo, " cfEmissive=", cfEmissive, " cfBump=", cfBump, " cfStencil=", cfStencil);
+
+        glGenTextures(1, &blendAlbedo);
+        glGenTextures(1, &blendEmissive);
+        glGenTextures(1, &blendBump);
+        glGenTextures(1, &blendStencil);
+
+        writeln("[oglInitRenderer] blendAlbedo=", blendAlbedo, " blendEmissive=", blendEmissive, " blendBump=", blendBump, " blendStencil=", blendStencil);
+
+        // Attach textures to framebuffer
+        glBindFramebuffer(GL_FRAMEBUFFER, fBuffer);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fAlbedo, 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, fEmissive, 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, fBump, 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, fStencil, 0);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, cfBuffer);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, cfAlbedo, 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, cfEmissive, 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, cfBump, 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, cfStencil, 0);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, blendFBO);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, blendAlbedo, 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, blendEmissive, 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, blendBump, 0);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, blendStencil, 0);
+
+        // go back to default fb
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+
+    void initializePartBackendResources() {
+        if (partBackendInitialized) return;
+        partBackendInitialized = true;
+
+        partShader = new Shader(PartShaderSource);
+        partShaderStage1 = new Shader(PartShaderStage1Source);
+        partShaderStage2 = new Shader(PartShaderStage2Source);
+        partMaskShader = new Shader(PartMaskShaderSource);
+
+        bindDrawableVao();
+
+        partShader.use();
+        partShader.setUniform(partShader.getUniformLocation("albedo"), 0);
+        partShader.setUniform(partShader.getUniformLocation("emissive"), 1);
+        partShader.setUniform(partShader.getUniformLocation("bumpmap"), 2);
+        mvp = partShader.getUniformLocation("mvp");
+        offset = partShader.getUniformLocation("offset");
+        gopacity = partShader.getUniformLocation("opacity");
+        gMultColor = partShader.getUniformLocation("multColor");
+        gScreenColor = partShader.getUniformLocation("screenColor");
+        gEmissionStrength = partShader.getUniformLocation("emissionStrength");
+
+        partShaderStage1.use();
+        partShaderStage1.setUniform(partShader.getUniformLocation("albedo"), 0);
+        gs1mvp = partShaderStage1.getUniformLocation("mvp");
+        gs1offset = partShaderStage1.getUniformLocation("offset");
+        gs1opacity = partShaderStage1.getUniformLocation("opacity");
+        gs1MultColor = partShaderStage1.getUniformLocation("multColor");
+        gs1ScreenColor = partShaderStage1.getUniformLocation("screenColor");
+
+        partShaderStage2.use();
+        partShaderStage2.setUniform(partShaderStage2.getUniformLocation("emissive"), 1);
+        partShaderStage2.setUniform(partShaderStage2.getUniformLocation("bumpmap"), 2);
+        gs2mvp = partShaderStage2.getUniformLocation("mvp");
+        gs2offset = partShaderStage2.getUniformLocation("offset");
+        gs2opacity = partShaderStage2.getUniformLocation("opacity");
+        gs2MultColor = partShaderStage2.getUniformLocation("multColor");
+        gs2ScreenColor = partShaderStage2.getUniformLocation("screenColor");
+        gs2EmissionStrength = partShaderStage2.getUniformLocation("emissionStrength");
+
+        partMaskShader.use();
+        partMaskShader.setUniform(partMaskShader.getUniformLocation("albedo"), 0);
+        partMaskShader.setUniform(partMaskShader.getUniformLocation("emissive"), 1);
+        partMaskShader.setUniform(partMaskShader.getUniformLocation("bumpmap"), 2);
+        mmvp = partMaskShader.getUniformLocation("mvp");
+        mthreshold = partMaskShader.getUniformLocation("threshold");
+    }
+
+    void initializeMaskBackend() {
+        ensureMaskBackendInitialized();
+    }
+
     void resizeViewportTargets(int width, int height) {
         // Work on texture unit 0 to avoid "no texture bound" errors.
         glActiveTexture(GL_TEXTURE0);
@@ -1364,11 +1356,39 @@ class RenderingBackend(BackendEnum backendType : BackendEnum.OpenGL) {
     }
 
     void bindDrawableVao() {
-        if (!drawableBuffersInitialized) {
-            drawableBuffersInitialized = true;
-            glGenVertexArrays(1, &drawableVAO);
-        }
+        ensureDrawableBackendInitialized();
         glBindVertexArray(drawableVAO);
+    }
+
+    void createDrawableBuffers(ref RenderResourceHandle ibo) {
+        ensureDrawableBackendInitialized();
+        if (ibo == 0) {
+            ibo = nextIndexHandle++;
+        }
+    }
+
+    void uploadDrawableIndices(RenderResourceHandle ibo, ushort[] indices) {
+        if (ibo == 0 || indices.length == 0) return;
+        auto bytes = cast(size_t)indices.length * ushort.sizeof;
+        ensureSharedIndexBuffer(bytes + sharedIndexOffset);
+
+        IndexRange range;
+        auto existing = ibo in sharedIndexRanges;
+        if (existing !is null) {
+            range = *existing;
+        }
+        if (existing is null || bytes > range.capacity) {
+            range.offset = sharedIndexOffset;
+            range.count = indices.length;
+            range.capacity = bytes;
+            sharedIndexOffset += bytes;
+        } else {
+            range.count = indices.length;
+        }
+        range.data = indices.dup;
+        sharedIndexRanges[ibo] = range;
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, sharedIndexBuffer);
+        glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, cast(GLintptr)range.offset, bytes, indices.ptr);
     }
 
     void rebindActiveTargets() {
@@ -2178,6 +2198,21 @@ class RenderingBackend(BackendEnum backendType : BackendEnum.OpenGL) {
     }
 
 private:
+    void ensureDrawableBackendInitialized() {
+        if (drawableBuffersInitialized) return;
+        drawableBuffersInitialized = true;
+        glGenVertexArrays(1, &drawableVAO);
+    }
+
+    void drawDrawableElements(RenderResourceHandle ibo, size_t indexCount) {
+        if (ibo == 0 || indexCount == 0) return;
+        auto rangePtr = ibo in sharedIndexRanges;
+        if (rangePtr is null || sharedIndexBuffer == 0) return;
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, sharedIndexBuffer);
+        auto offset = rangePtr.offset;
+        glDrawElements(GL_TRIANGLES, cast(int)indexCount, GL_UNSIGNED_SHORT, cast(void*)offset);
+    }
+
     Shader getBlendShader(BlendMode mode) {
         ensureBlendShadersInitialized();
         auto shader = mode in blendShaders;
@@ -2221,7 +2256,7 @@ private:
         glBindBuffer(GL_ARRAY_BUFFER, sharedDbo);
         glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 0, cast(void*)deformLane1Offset);
 
-        oglDrawDrawableElements(packet.indexBuffer, packet.indexCount);
+        drawDrawableElements(packet.indexBuffer, packet.indexCount);
         markBufferInUse(sharedVbo);
         markBufferInUse(sharedDbo);
 
@@ -2373,7 +2408,7 @@ private:
         glBindBuffer(GL_ARRAY_BUFFER, deformBuffer);
         glVertexAttribPointer(5, 1, GL_FLOAT, GL_FALSE, 0, cast(void*)deformLane1Offset);
 
-        oglDrawDrawableElements(packet.indexBuffer, indexCount);
+        drawDrawableElements(packet.indexBuffer, indexCount);
         markBufferInUse(vertexBuffer);
         markBufferInUse(uvBuffer);
         markBufferInUse(deformBuffer);
@@ -2436,57 +2471,6 @@ enum ShaderAsset PartShaderStage1Source = shaderAsset!("opengl/shaders/opengl/ba
 enum ShaderAsset PartShaderStage2Source = shaderAsset!("opengl/shaders/opengl/basic/basic.vert","opengl/shaders/opengl/basic/basic-stage2.frag")();
 enum ShaderAsset PartMaskShaderSource = shaderAsset!("opengl/shaders/opengl/basic/basic.vert","opengl/shaders/opengl/basic/basic-mask.frag")();
 }
-
-void oglInitPartBackendResources() {
-    if (partBackendInitialized) return;
-    partBackendInitialized = true;
-
-    partShader = new Shader(PartShaderSource);
-    partShaderStage1 = new Shader(PartShaderStage1Source);
-    partShaderStage2 = new Shader(PartShaderStage2Source);
-    partMaskShader = new Shader(PartMaskShaderSource);
-
-    incDrawableBindVAO();
-
-    partShader.use();
-    partShader.setUniform(partShader.getUniformLocation("albedo"), 0);
-    partShader.setUniform(partShader.getUniformLocation("emissive"), 1);
-    partShader.setUniform(partShader.getUniformLocation("bumpmap"), 2);
-    mvp = partShader.getUniformLocation("mvp");
-    offset = partShader.getUniformLocation("offset");
-    gopacity = partShader.getUniformLocation("opacity");
-    gMultColor = partShader.getUniformLocation("multColor");
-    gScreenColor = partShader.getUniformLocation("screenColor");
-    gEmissionStrength = partShader.getUniformLocation("emissionStrength");
-
-    partShaderStage1.use();
-    partShaderStage1.setUniform(partShader.getUniformLocation("albedo"), 0);
-    gs1mvp = partShaderStage1.getUniformLocation("mvp");
-    gs1offset = partShaderStage1.getUniformLocation("offset");
-    gs1opacity = partShaderStage1.getUniformLocation("opacity");
-    gs1MultColor = partShaderStage1.getUniformLocation("multColor");
-    gs1ScreenColor = partShaderStage1.getUniformLocation("screenColor");
-
-    partShaderStage2.use();
-    partShaderStage2.setUniform(partShaderStage2.getUniformLocation("emissive"), 1);
-    partShaderStage2.setUniform(partShaderStage2.getUniformLocation("bumpmap"), 2);
-    gs2mvp = partShaderStage2.getUniformLocation("mvp");
-    gs2offset = partShaderStage2.getUniformLocation("offset");
-    gs2opacity = partShaderStage2.getUniformLocation("opacity");
-    gs2MultColor = partShaderStage2.getUniformLocation("multColor");
-    gs2ScreenColor = partShaderStage2.getUniformLocation("screenColor");
-    gs2EmissionStrength = partShaderStage2.getUniformLocation("emissionStrength");
-
-    partMaskShader.use();
-    partMaskShader.setUniform(partMaskShader.getUniformLocation("albedo"), 0);
-    partMaskShader.setUniform(partMaskShader.getUniformLocation("emissive"), 1);
-    partMaskShader.setUniform(partMaskShader.getUniformLocation("bumpmap"), 2);
-    mmvp = partMaskShader.getUniformLocation("mvp");
-    mthreshold = partMaskShader.getUniformLocation("threshold");
-
-}
-
-
 
 // ---- source/nlshim/core/render/backends/opengl/runtime.d ----
 
@@ -2627,77 +2611,6 @@ private {
 
 // Things only available internally for nijilive rendering
 public {
-/**
-        Initializes the renderer (OpenGL-specific portion)
-    */
-    void oglInitRenderer() {
-
-        // Set the viewport and by extension set the textures
-        inSetViewport(640, 480);
-        version(InDoesRender) inInitDebug();
-
-        
-            
-        // Shader for scene
-        basicSceneShader = PostProcessingShader(new Shader(SceneShaderSource));
-        glGenVertexArrays(1, &sceneVAO);
-        glGenBuffers(1, &sceneVBO);
-
-            import std.stdio : writeln;
-            writeln("[oglInitRenderer] sceneVAO=", sceneVAO, " sceneVBO=", sceneVBO);
-
-            // Generate the framebuffer we'll be using to render the model and composites
-            glGenFramebuffers(1, &fBuffer);
-            glGenFramebuffers(1, &cfBuffer);
-            glGenFramebuffers(1, &blendFBO);
-            
-            // Generate the color and stencil-depth textures needed
-            // Note: we're not using the depth buffer but OpenGL 3.4 does not support stencil-only buffers
-            glGenTextures(1, &fAlbedo);
-            glGenTextures(1, &fEmissive);
-            glGenTextures(1, &fBump);
-            glGenTextures(1, &fStencil);
-
-            writeln("[oglInitRenderer] fAlbedo=", fAlbedo, " fEmissive=", fEmissive, " fBump=", fBump, " fStencil=", fStencil);
-
-            glGenTextures(1, &cfAlbedo);
-            glGenTextures(1, &cfEmissive);
-            glGenTextures(1, &cfBump);
-            glGenTextures(1, &cfStencil);
-
-            writeln("[oglInitRenderer] cfAlbedo=", cfAlbedo, " cfEmissive=", cfEmissive, " cfBump=", cfBump, " cfStencil=", cfStencil);
-
-            glGenTextures(1, &blendAlbedo);
-            glGenTextures(1, &blendEmissive);
-            glGenTextures(1, &blendBump);
-            glGenTextures(1, &blendStencil);
-
-            writeln("[oglInitRenderer] blendAlbedo=", blendAlbedo, " blendEmissive=", blendEmissive, " blendBump=", blendBump, " blendStencil=", blendStencil);
-
-            // Attach textures to framebuffer
-            glBindFramebuffer(GL_FRAMEBUFFER, fBuffer);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fAlbedo, 0);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, fEmissive, 0);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, fBump, 0);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, fStencil, 0);
-
-            glBindFramebuffer(GL_FRAMEBUFFER, cfBuffer);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, cfAlbedo, 0);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, cfEmissive, 0);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, cfBump, 0);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, cfStencil, 0);
-
-            glBindFramebuffer(GL_FRAMEBUFFER, blendFBO);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, blendAlbedo, 0);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, blendEmissive, 0);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, blendBump, 0);
-            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, blendStencil, 0);
-
-            // go back to default fb
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-        
-    }
 }
 
 // ---- source/nlshim/core/render/backends/opengl/shader_backend.d ----
@@ -2776,15 +2689,6 @@ if (VecInfo!Vec.isValid) {
 
 // ---- source/nlshim/core/render/backends/opengl/texture_backend.d ----
 
-
-mixin template TextureBackendStub() {
-    alias GLId = uint;
-}
-
-version (unittest) {
-    mixin TextureBackendStub;
-} else 
-
 import bindbc.opengl;
 import std.exception : enforce;
 
@@ -2841,110 +2745,6 @@ version (Windows) {
     }
 }
 
-/*
-class RenderingBackend(BackendEnum backendType) if (backendType != BackendEnum.OpenGL){
-    private auto backendUnsupported(T = void)(string func) {
-        enforce(false, "Rendering backend "~backendType.stringof~" does not implement "~func);
-        static if (!is(T == void)) {
-            return T.init;
-        }
-    }
-
-    void initializeRenderer() { backendUnsupported(__FUNCTION__); }
-    void resizeViewportTargets(int width, int height) { backendUnsupported(__FUNCTION__); }
-    void dumpViewport(ref ubyte[] data, int width, int height) { backendUnsupported(__FUNCTION__); }
-    void beginScene() { backendUnsupported(__FUNCTION__); }
-    void endScene() { backendUnsupported(__FUNCTION__); }
-    void postProcessScene() { backendUnsupported(__FUNCTION__); }
-
-    void initializeDrawableResources() { backendUnsupported(__FUNCTION__); }
-    void bindDrawableVao() { backendUnsupported(__FUNCTION__); }
-    void createDrawableBuffers(out uint ibo) { backendUnsupported(__FUNCTION__); }
-    void uploadDrawableIndices(uint ibo, ushort[] indices) { backendUnsupported(__FUNCTION__); }
-    void uploadSharedVertexBuffer(Vec2Array vertices) { backendUnsupported(__FUNCTION__); }
-    void uploadSharedUvBuffer(Vec2Array uvs) { backendUnsupported(__FUNCTION__); }
-    void uploadSharedDeformBuffer(Vec2Array deform) { backendUnsupported(__FUNCTION__); }
-    void drawDrawableElements(uint ibo, size_t indexCount) { backendUnsupported(__FUNCTION__); }
-
-    bool supportsAdvancedBlend() { return backendUnsupported!bool(__FUNCTION__); }
-    bool supportsAdvancedBlendCoherent() { return backendUnsupported!bool(__FUNCTION__); }
-    void setAdvancedBlendCoherent(bool enabled) { backendUnsupported(__FUNCTION__); }
-    void setLegacyBlendMode(BlendMode mode) { backendUnsupported(__FUNCTION__); }
-    void setAdvancedBlendEquation(BlendMode mode) { backendUnsupported(__FUNCTION__); }
-    void issueBlendBarrier() { backendUnsupported(__FUNCTION__); }
-    void initDebugRenderer() { backendUnsupported(__FUNCTION__); }
-    void setDebugPointSize(float size) { backendUnsupported(__FUNCTION__); }
-    void setDebugLineWidth(float size) { backendUnsupported(__FUNCTION__); }
-    void uploadDebugBuffer(Vec3Array points, ushort[] indices) { backendUnsupported(__FUNCTION__); }
-    void setDebugExternalBuffer(uint vbo, uint ibo, int count) { backendUnsupported(__FUNCTION__); }
-    void drawDebugPoints(vec4 color, mat4 mvp) { backendUnsupported(__FUNCTION__); }
-    void drawDebugLines(vec4 color, mat4 mvp) { backendUnsupported(__FUNCTION__); }
-
-    void drawPartPacket(ref PartDrawPacket packet) { backendUnsupported(__FUNCTION__); }
-    void drawMaskPacket(ref MaskDrawPacket packet) { backendUnsupported(__FUNCTION__); }
-    void beginDynamicComposite(DynamicCompositePass pass) { backendUnsupported(__FUNCTION__); }
-    void endDynamicComposite(DynamicCompositePass pass) { backendUnsupported(__FUNCTION__); }
-    void destroyDynamicComposite(DynamicCompositeSurface surface) { backendUnsupported(__FUNCTION__); }
-    void beginMask(bool useStencil) { backendUnsupported(__FUNCTION__); }
-    void applyMask(ref MaskApplyPacket packet) { backendUnsupported(__FUNCTION__); }
-    void beginMaskContent() { backendUnsupported(__FUNCTION__); }
-    void endMask() { backendUnsupported(__FUNCTION__); }
-    void drawTextureAtPart(Texture texture, Part part) { backendUnsupported(__FUNCTION__); }
-    void drawTextureAtPosition(Texture texture, vec2 position, float opacity,
-                               vec3 color, vec3 screenColor) { backendUnsupported(__FUNCTION__); }
-    void drawTextureAtRect(Texture texture, rect area, rect uvs,
-                           float opacity, vec3 color, vec3 screenColor,
-                           Shader shader = null, Camera cam = null) { backendUnsupported(__FUNCTION__); }
-    uint framebufferHandle() { return backendUnsupported!uint(__FUNCTION__); }
-    uint renderImageHandle() { return backendUnsupported!uint(__FUNCTION__); }
-    uint compositeFramebufferHandle() { return 0; }
-    uint compositeImageHandle() { return 0; }
-    uint mainAlbedoHandle() { return backendUnsupported!uint(__FUNCTION__); }
-    uint mainEmissiveHandle() { return backendUnsupported!uint(__FUNCTION__); }
-    uint mainBumpHandle() { return backendUnsupported!uint(__FUNCTION__); }
-    uint compositeEmissiveHandle() { return 0; }
-    uint compositeBumpHandle() { return 0; }
-    uint blendFramebufferHandle() { return backendUnsupported!uint(__FUNCTION__); }
-    uint blendAlbedoHandle() { return backendUnsupported!uint(__FUNCTION__); }
-    uint blendEmissiveHandle() { return backendUnsupported!uint(__FUNCTION__); }
-    uint blendBumpHandle() { return backendUnsupported!uint(__FUNCTION__); }
-    void addBasicLightingPostProcess() { backendUnsupported(__FUNCTION__); }
-    void setDifferenceAggregationEnabled(bool enabled) { backendUnsupported(__FUNCTION__); }
-    bool isDifferenceAggregationEnabled() { return backendUnsupported!bool(__FUNCTION__); }
-    void setDifferenceAggregationRegion(DifferenceEvaluationRegion region) { backendUnsupported(__FUNCTION__); }
-    DifferenceEvaluationRegion getDifferenceAggregationRegion() { return backendUnsupported!DifferenceEvaluationRegion(__FUNCTION__); }
-    bool evaluateDifferenceAggregation(uint texture, int width, int height) { return backendUnsupported!bool(__FUNCTION__); }
-    bool fetchDifferenceAggregationResult(out DifferenceEvaluationResult result) { return backendUnsupported!bool(__FUNCTION__); }
-
-    RenderShaderHandle createShader(string vertexSource, string fragmentSource) { return backendUnsupported!RenderShaderHandle(__FUNCTION__); }
-    void destroyShader(RenderShaderHandle shader) { backendUnsupported(__FUNCTION__); }
-    void useShader(RenderShaderHandle shader) { backendUnsupported(__FUNCTION__); }
-    int getShaderUniformLocation(RenderShaderHandle shader, string name) { return backendUnsupported!int(__FUNCTION__); }
-    void setShaderUniform(RenderShaderHandle shader, int location, bool value) { backendUnsupported(__FUNCTION__); }
-    void setShaderUniform(RenderShaderHandle shader, int location, int value) { backendUnsupported(__FUNCTION__); }
-    void setShaderUniform(RenderShaderHandle shader, int location, float value) { backendUnsupported(__FUNCTION__); }
-    void setShaderUniform(RenderShaderHandle shader, int location, vec2 value) { backendUnsupported(__FUNCTION__); }
-    void setShaderUniform(RenderShaderHandle shader, int location, vec3 value) { backendUnsupported(__FUNCTION__); }
-    void setShaderUniform(RenderShaderHandle shader, int location, vec4 value) { backendUnsupported(__FUNCTION__); }
-    void setShaderUniform(RenderShaderHandle shader, int location, mat4 value) { backendUnsupported(__FUNCTION__); }
-
-    RenderTextureHandle createTextureHandle() { return backendUnsupported!RenderTextureHandle(__FUNCTION__); }
-    void destroyTextureHandle(RenderTextureHandle texture) { backendUnsupported(__FUNCTION__); }
-    void bindTextureHandle(RenderTextureHandle texture, uint unit) { backendUnsupported(__FUNCTION__); }
-    void uploadTextureData(RenderTextureHandle texture, int width, int height, int inChannels,
-                           int outChannels, bool stencil, ubyte[] data) { backendUnsupported(__FUNCTION__); }
-    void updateTextureRegion(RenderTextureHandle texture, int x, int y, int width, int height,
-                             int channels, ubyte[] data) { backendUnsupported(__FUNCTION__); }
-    void generateTextureMipmap(RenderTextureHandle texture) { backendUnsupported(__FUNCTION__); }
-    void applyTextureFiltering(RenderTextureHandle texture, Filtering filtering, bool useMipmaps = true) { backendUnsupported(__FUNCTION__); }
-    void applyTextureWrapping(RenderTextureHandle texture, Wrapping wrapping) { backendUnsupported(__FUNCTION__); }
-    void applyTextureAnisotropy(RenderTextureHandle texture, float value) { backendUnsupported(__FUNCTION__); }
-    float maxTextureAnisotropy() { return backendUnsupported!float(__FUNCTION__); }
-    void readTextureData(RenderTextureHandle texture, int channels, bool stencil,
-                         ubyte[] buffer) { backendUnsupported(__FUNCTION__); }
-    size_t textureNativeHandle(RenderTextureHandle texture) { return backendUnsupported!size_t(__FUNCTION__); }
-}
-*/
 version (RenderBackendOpenGL) {
     enum SelectedBackend = BackendEnum.OpenGL;
 } else version (RenderBackendDirectX12) {
@@ -2955,41 +2755,19 @@ version (RenderBackendOpenGL) {
     enum SelectedBackend = BackendEnum.OpenGL;
 }
 
-version (UseQueueBackend) {
-    enum bool SelectedBackendIsOpenGL = false;
-} else {
-    enum bool SelectedBackendIsOpenGL = SelectedBackend == BackendEnum.OpenGL;
-}
-
-
-    version (UseQueueBackend) {
+template RenderingBackend(BackendEnum backendType) {
+    static if (backendType == BackendEnum.OpenGL) {
+        alias RenderingBackend = core.render.backends.opengl.RenderingBackend!(backendType);
+    } else static if (backendType == BackendEnum.DirectX12) {
+        alias RenderingBackend = core.render.backends.directx12.RenderingBackend!(backendType);
     } else {
-        version (RenderBackendDirectX12) {
-        }
+        enum msg = "RenderingBackend!("~backendType.stringof~") is not implemented. Available options: BackendEnum.OpenGL, BackendEnum.DirectX12.";
+        pragma(msg, msg);
+        static assert(backendType == BackendEnum.OpenGL || backendType == BackendEnum.DirectX12, msg);
     }
-
-
-version (UseQueueBackend) {
-} else {
 }
 
-version (UseQueueBackend) {
-    alias RenderBackend = core.render.backends.queue.RenderingBackend!(BackendEnum.OpenGL);
-} else {
-    template RenderingBackend(BackendEnum backendType) {
-        static if (backendType == BackendEnum.OpenGL) {
-            alias RenderingBackend = core.render.backends.opengl.RenderingBackend!(backendType);
-        } else static if (backendType == BackendEnum.DirectX12) {
-            alias RenderingBackend = core.render.backends.directx12.RenderingBackend!(backendType);
-        } else {
-            enum msg = "RenderingBackend!("~backendType.stringof~") is not implemented. Available options: BackendEnum.OpenGL, BackendEnum.DirectX12.";
-            pragma(msg, msg);
-            static assert(backendType == BackendEnum.OpenGL || backendType == BackendEnum.DirectX12, msg);
-        }
-    }
-
-    alias RenderBackend = RenderingBackend!(BackendEnum.OpenGL);
-}
+alias RenderBackend = RenderingBackend!(BackendEnum.OpenGL);
 
 // ---- source/nlshim/core/render/commands.d ----
 
@@ -3260,13 +3038,6 @@ private void inSetBlendModeLegacy(BlendMode blendingMode) {
     setLegacyBlendMode(blendingMode);
 }
 
-public void inInitBlending() {
-    inForceTripleBufferFallback = inDefaultTripleBufferFallback;
-    inAdvancedBlendingAvailable = hasAdvancedBlendSupport();
-    inAdvancedBlendingCoherentAvailable = hasAdvancedBlendCoherentSupport();
-    inApplyBlendingCapabilities();
-}
-
 public void nlSetTripleBufferFallback(bool enable) {
     if (inForceTripleBufferFallback == enable) return;
     inForceTripleBufferFallback = enable;
@@ -3415,11 +3186,6 @@ void inGetViewport(out int width, out int height) {
     }
     width = inViewportWidth[$-1];
     height = inViewportHeight[$-1];
-}
-
-/// Clear color setter.
-void inSetClearColor(float r, float g, float b, float a) {
-    inClearColor = vec4(r, g, b, a);
 }
 
 /// Clear color getter.
@@ -3612,9 +3378,6 @@ public:
     Authors: Luna Nielsen
 */
 
-version (UseQueueBackend) {
-    extern(C) __gshared void function(size_t handle) ngReleaseExternalHandle; // module-level hook for Unity external texture release
-}
 import std.exception;
 import std.format;
 import imagefmt;
@@ -3749,7 +3512,6 @@ private:
     int channels_;
     bool stencil_;
     bool useMipmaps_ = true;
-    size_t externalHandle = 0;
 
     uint uuid;
 
@@ -3981,25 +3743,10 @@ public:
             auto backend = tryRenderBackend();
             if (backend !is null) backend.destroyTextureHandle(handle);
             handle = null;
-        
-        version (UseQueueBackend) {
-            if (externalHandle && ngReleaseExternalHandle !is null) {
-                ngReleaseExternalHandle(externalHandle);
-            }
-            externalHandle = 0;
-        }
     }
 
     RenderTextureHandle backendHandle() {
         return handle;
-    }
-
-    /// Unity/queue backend: allow external handle injection.
-    version (UseQueueBackend) {
-
-        size_t getExternalHandle() const {
-            return externalHandle;
-        }
     }
 
     Texture dup() {
