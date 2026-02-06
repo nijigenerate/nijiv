@@ -191,8 +191,8 @@ OpenGLBackendInit initOpenGLBackend(int width, int height, bool isTest) {
 
     // Attach RenderBackend so nlshim Texture can allocate handles.
     inSetRenderBackend(new RenderBackend());
-    // Keep nlshim viewport state in sync with actual drawable size.
-    inSetViewport(drawableW, drawableH);
+    // Keep viewport state in sync with actual drawable size.
+    currentRenderBackend().setViewport(drawableW, drawableH);
     if (!gBackendInitialized) {
         gBackendInitialized = true;
         // Initialize nlshim OpenGL resources to back the queue callbacks.
@@ -258,166 +258,10 @@ OpenGLBackendInit initOpenGLBackend(int width, int height, bool isTest) {
 }
 
 // ==== Rendering pipeline ====
-__gshared GLuint gProgram;
-__gshared GLuint gVao;
-__gshared GLuint gVboPos;
-__gshared GLuint gVboUv;
-__gshared GLuint gEbo;
-__gshared GLint gMvpLoc = -1;
-__gshared GLint gTintLoc = -1;
-__gshared GLint gScreenLoc = -1;
-__gshared GLint gOpacityLoc = -1;
-
-// Shared vertex/uv/deform buffers uploaded per frame.
-__gshared GLuint gSharedVertexVbo;
-__gshared GLuint gSharedUvVbo;
-__gshared GLuint gSharedDeformVbo;
-// Debug thumbnail rendering buffers.
-__gshared GLuint gDbgQuadVbo;
-__gshared GLuint gDbgQuadUvVbo;
-__gshared GLuint gDbgQuadEbo;
-__gshared GLuint gThumbFbo;
-__gshared GLuint gThumbColor;
-__gshared GLuint gDebugTestTex;
-__gshared GLuint gThumbProg;
-__gshared GLint gThumbMvpLoc = -1;
-__gshared GLuint gThumbVao;
-__gshared GLuint gThumbQuadVbo;
-__gshared GLuint gThumbQuadEbo;
 /// Lookup Texture created via callbacks.
 Texture toTex(size_t h) {
     auto tex = h in gTextures;
     return tex is null ? null : *tex;
-}
-
-void ensureThumbVao() {
-    if (gThumbVao == 0) {
-        glGenVertexArrays(1, &gThumbVao);
-    }
-    if (gThumbQuadVbo == 0) glGenBuffers(1, &gThumbQuadVbo);
-    if (gThumbQuadEbo == 0) glGenBuffers(1, &gThumbQuadEbo);
-}
-
-
-/// Draw a texture as a rectangle in screen pixel coordinates (uses same simple shader).
-private void drawTile(GLuint texId, float x, float y, float size, int screenW, int screenH) {
-    if (texId == 0) return;
-    ensureThumbProgram();
-    ensureThumbVao();
-    // 保守的にターゲットとビューポートを設定し直す
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, screenW, screenH);
-    glUseProgram(gThumbProg);
-    // 直接クリップ座標に変換して恒等行列を渡す
-    float left = (x / cast(float)screenW) * 2f - 1f;
-    float right = ((x + size) / cast(float)screenW) * 2f - 1f;
-    float top = (y / cast(float)screenH) * 2f - 1f;
-    float bottom = ((y + size) / cast(float)screenH) * 2f - 1f;
-    if (gThumbMvpLoc >= 0) {
-        float[16] ident = [1,0,0,0,
-                           0,1,0,0,
-                           0,0,1,0,
-                           0,0,0,1];
-        glUniformMatrix4fv(gThumbMvpLoc, 1, GL_FALSE, ident.ptr);
-    }
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, texId);
-
-    // Two triangles (6 vertices) to avoid strip-related surprises.
-    float[24] verts = [
-        // tri 1
-        left,  top,    0, 0,
-        right, top,    1, 0,
-        left,  bottom, 0, 1,
-        // tri 2
-        right, top,    1, 0,
-        right, bottom, 1, 1,
-        left,  bottom, 0, 1
-    ];
-    glBindVertexArray(gThumbVao);
-    glBindBuffer(GL_ARRAY_BUFFER, gThumbQuadVbo);
-    glBufferData(GL_ARRAY_BUFFER, verts.length * float.sizeof, verts.ptr, GL_STREAM_DRAW);
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, cast(int)(4 * float.sizeof), cast(void*)0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, cast(int)(4 * float.sizeof), cast(void*)(2 * float.sizeof));
-    glDisableVertexAttribArray(2);
-    glDisableVertexAttribArray(3);
-    glDisableVertexAttribArray(4);
-    glDisableVertexAttribArray(5);
-    glDrawArrays(GL_TRIANGLES, 0, 6);
-    glBindVertexArray(0);
-}
-
-void ensureDebugTestTex() {
-    if (gDebugTestTex != 0) return;
-    const int sz = 48;
-    ubyte[sz*sz*4] pixels;
-    foreach (y; 0 .. sz) foreach (x; 0 .. sz) {
-        bool on = ((x / 6) ^ (y / 6)) & 1;
-        auto idx = (y * sz + x) * 4;
-        pixels[idx + 0] = on ? 255 : 30;
-        pixels[idx + 1] = on ? 128 : 30;
-        pixels[idx + 2] = on ? 64 : 30;
-        pixels[idx + 3] = 255;
-    }
-    glGenTextures(1, &gDebugTestTex);
-    glBindTexture(GL_TEXTURE_2D, gDebugTestTex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, sz, sz, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.ptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-}
-
-void ensureThumbProgram() {
-    if (gThumbProg != 0) return;
-    enum string vsSrc = q{
-        #version 330 core
-        uniform mat4 mvp;
-        layout(location = 0) in vec2 inPos;
-        layout(location = 1) in vec2 inUv;
-        out vec2 vUv;
-        void main() {
-            gl_Position = mvp * vec4(inPos, 0.0, 1.0);
-            vUv = inUv;
-        }
-    };
-    enum string fsSrc = q{
-        #version 330 core
-        in vec2 vUv;
-        layout(location = 0) out vec4 outColor;
-        uniform sampler2D albedo;
-        void main() {
-            outColor = texture(albedo, vUv);
-        }
-    };
-    auto compile = (GLenum kind, string src) {
-        GLuint s = glCreateShader(kind);
-        const(char)* p = src.ptr;
-        glShaderSource(s, 1, &p, null);
-        glCompileShader(s);
-        GLint ok = 0;
-        glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
-        enforce(ok == GL_TRUE, "thumb shader compile failed");
-        return s;
-    };
-    GLuint vs = compile(GL_VERTEX_SHADER, vsSrc);
-    GLuint fs = compile(GL_FRAGMENT_SHADER, fsSrc);
-    gThumbProg = glCreateProgram();
-    glAttachShader(gThumbProg, vs);
-    glAttachShader(gThumbProg, fs);
-    glLinkProgram(gThumbProg);
-    GLint linked = 0;
-    glGetProgramiv(gThumbProg, GL_LINK_STATUS, &linked);
-    enforce(linked == GL_TRUE, "thumb shader link failed");
-    glDeleteShader(vs);
-    glDeleteShader(fs);
-    glUseProgram(gThumbProg);
-    GLint albedoLoc = glGetUniformLocation(gThumbProg, "albedo");
-    if (albedoLoc >= 0) glUniform1i(albedoLoc, 0);
-    gThumbMvpLoc = glGetUniformLocation(gThumbProg, "mvp");
-    glUseProgram(0);
 }
 
 // Bridge: convert DLL packets to backend PartDrawPacket/MaskDrawPacket and call ogl*.
@@ -428,6 +272,7 @@ void renderCommands(const OpenGLBackendInit* gl,
     if (gl is null) return;
     import std.stdio : writeln;
     auto backend = currentRenderBackend();
+    auto debugTextureBackend = currentDebugTextureBackend();
     // 先頭数件について、実際に参照するオフセット周辺のバッファ内容をダンプする。
     auto logPacketLayout = () {
         string path = "/Users/seagetch/src/nijigenerate/nijiv/test_layout.log";
@@ -816,15 +661,15 @@ void renderCommands(const OpenGLBackendInit* gl,
         glClear(GL_COLOR_BUFFER_BIT);
         glDisable(GL_SCISSOR_TEST);
 
-        ensureDebugTestTex();
+        debugTextureBackend.ensureDebugTestTex();
         float tx = pad;
         float ty = pad;
         // First tile: debug checkerboard
-        drawTile(gDebugTestTex, tx, ty, tile, gl.drawableW, gl.drawableH);
+        debugTextureBackend.drawTile(debugTextureBackend.debugTestTextureId(), tx, ty, tile, gl.drawableW, gl.drawableH);
         ty += tile + pad;
         foreach (handle, tex; gTextures) {
             if (tex !is null) {
-                drawTile(tex.getTextureId(), tx, ty, tile, gl.drawableW, gl.drawableH);
+                debugTextureBackend.drawTile(tex.getTextureId(), tx, ty, tile, gl.drawableW, gl.drawableH);
                 ty += tile + pad;
                 if (ty + tile > gl.drawableH - pad) {
                     ty = pad;
@@ -879,8 +724,6 @@ void renderCommands(const OpenGLBackendInit* gl,
 import bindbc.opengl;
 import bindbc.opengl.context;
 
-void markBufferInUse(uint /*buffer*/) {}
-
 
 
 // ---- source/nlshim/core/render/backends/opengl/debug_renderer.d ----
@@ -889,22 +732,6 @@ void markBufferInUse(uint /*buffer*/) {}
 
 
 import bindbc.opengl;
-
-private GLuint vao;
-private GLuint vbo;
-private GLuint ibo;
-private GLuint currentVbo;
-private int indexCount;
-
-private void ensureInitialized() {
-    if (vao != 0) return;
-
-    glGenVertexArrays(1, &vao);
-    glGenBuffers(1, &vbo);
-    glGenBuffers(1, &ibo);
-    currentVbo = vbo;
-    indexCount = 0;
-}
 
 
 
@@ -922,40 +749,6 @@ import bindbc.opengl;
 
 
 import bindbc.opengl;
-
-private GLuint textureId(Texture texture) {
-    if (texture is null) return 0;
-    auto handle = texture.backendHandle();
-    if (handle is null) return 0;
-    return requireGLTexture(handle).id;
-}
-
-private {
-    void logFboState(string tag) {
-        GLint drawFbo;
-        GLint readFbo;
-        GLint[4] vp;
-        GLint[4] dbufs;
-        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFbo);
-        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFbo);
-        glGetIntegerv(GL_VIEWPORT, vp.ptr);
-        foreach (i; 0 .. 4) {
-            glGetIntegerv(GL_DRAW_BUFFER0 + i, &dbufs[i]);
-        }
-        auto status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-        GLint err = glGetError();
-        import std.stdio : writefln;
-        writefln("[dc-log] %s drawFbo=%s readFbo=%s drawBufs=%s status=0x%x vp=%s err=%s",
-            tag, drawFbo, readFbo, dbufs, status, vp, err);
-    }
-
-    void logGlErr(string tag) {
-        GLint err = glGetError();
-        import std.stdio : writefln;
-        writefln("[dc-err] %s glError=%s", tag, err);
-    }
-
-}
 
 // ---- source/nlshim/core/render/backends/opengl/handles.d ----
 
@@ -979,6 +772,149 @@ GLTextureHandle requireGLTexture(RenderTextureHandle handle) {
     auto result = cast(GLTextureHandle)handle;
     enforce(result !is null, "Texture handle is not backed by OpenGL");
     return result;
+}
+
+class DebugTextureBackend {
+private:
+    GLuint debugThumbTex;
+    GLuint debugThumbProg;
+    GLint debugThumbMvpLoc = -1;
+    GLuint debugThumbVao;
+    GLuint debugThumbQuadVbo;
+    GLuint debugThumbQuadEbo;
+
+    void ensureThumbVao() {
+        if (debugThumbVao == 0) {
+            glGenVertexArrays(1, &debugThumbVao);
+        }
+        if (debugThumbQuadVbo == 0) glGenBuffers(1, &debugThumbQuadVbo);
+        if (debugThumbQuadEbo == 0) glGenBuffers(1, &debugThumbQuadEbo);
+    }
+
+    void ensureThumbProgram() {
+        if (debugThumbProg != 0) return;
+        enum string vsSrc = q{
+            #version 330 core
+            uniform mat4 mvp;
+            layout(location = 0) in vec2 inPos;
+            layout(location = 1) in vec2 inUv;
+            out vec2 vUv;
+            void main() {
+                gl_Position = mvp * vec4(inPos, 0.0, 1.0);
+                vUv = inUv;
+            }
+        };
+        enum string fsSrc = q{
+            #version 330 core
+            in vec2 vUv;
+            layout(location = 0) out vec4 outColor;
+            uniform sampler2D albedo;
+            void main() {
+                outColor = texture(albedo, vUv);
+            }
+        };
+        auto compile = (GLenum kind, string src) {
+            GLuint s = glCreateShader(kind);
+            const(char)* p = src.ptr;
+            glShaderSource(s, 1, &p, null);
+            glCompileShader(s);
+            GLint ok = 0;
+            glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+            enforce(ok == GL_TRUE, "thumb shader compile failed");
+            return s;
+        };
+        GLuint vs = compile(GL_VERTEX_SHADER, vsSrc);
+        GLuint fs = compile(GL_FRAGMENT_SHADER, fsSrc);
+        debugThumbProg = glCreateProgram();
+        glAttachShader(debugThumbProg, vs);
+        glAttachShader(debugThumbProg, fs);
+        glLinkProgram(debugThumbProg);
+        GLint linked = 0;
+        glGetProgramiv(debugThumbProg, GL_LINK_STATUS, &linked);
+        enforce(linked == GL_TRUE, "thumb shader link failed");
+        glDeleteShader(vs);
+        glDeleteShader(fs);
+        glUseProgram(debugThumbProg);
+        GLint albedoLoc = glGetUniformLocation(debugThumbProg, "albedo");
+        if (albedoLoc >= 0) glUniform1i(albedoLoc, 0);
+        debugThumbMvpLoc = glGetUniformLocation(debugThumbProg, "mvp");
+        glUseProgram(0);
+    }
+
+public:
+    void ensureDebugTestTex() {
+        if (debugThumbTex != 0) return;
+        const int sz = 48;
+        ubyte[sz*sz*4] pixels;
+        foreach (y; 0 .. sz) foreach (x; 0 .. sz) {
+            bool on = ((x / 6) ^ (y / 6)) & 1;
+            auto idx = (y * sz + x) * 4;
+            pixels[idx + 0] = on ? 255 : 30;
+            pixels[idx + 1] = on ? 128 : 30;
+            pixels[idx + 2] = on ? 64 : 30;
+            pixels[idx + 3] = 255;
+        }
+        glGenTextures(1, &debugThumbTex);
+        glBindTexture(GL_TEXTURE_2D, debugThumbTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, sz, sz, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.ptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+
+    void drawTile(GLuint texId, float x, float y, float size, int screenW, int screenH) {
+        if (texId == 0) return;
+        ensureThumbProgram();
+        ensureThumbVao();
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, screenW, screenH);
+        glUseProgram(debugThumbProg);
+        float left = (x / cast(float)screenW) * 2f - 1f;
+        float right = ((x + size) / cast(float)screenW) * 2f - 1f;
+        float top = (y / cast(float)screenH) * 2f - 1f;
+        float bottom = ((y + size) / cast(float)screenH) * 2f - 1f;
+        if (debugThumbMvpLoc >= 0) {
+            float[16] ident = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1];
+            glUniformMatrix4fv(debugThumbMvpLoc, 1, GL_FALSE, ident.ptr);
+        }
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, texId);
+        float[24] verts = [
+            left,  top,    0, 0,
+            right, top,    1, 0,
+            left,  bottom, 0, 1,
+            right, top,    1, 0,
+            right, bottom, 1, 1,
+            left,  bottom, 0, 1
+        ];
+        glBindVertexArray(debugThumbVao);
+        glBindBuffer(GL_ARRAY_BUFFER, debugThumbQuadVbo);
+        glBufferData(GL_ARRAY_BUFFER, verts.length * float.sizeof, verts.ptr, GL_STREAM_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, cast(int)(4 * float.sizeof), cast(void*)0);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, cast(int)(4 * float.sizeof), cast(void*)(2 * float.sizeof));
+        glDisableVertexAttribArray(2);
+        glDisableVertexAttribArray(3);
+        glDisableVertexAttribArray(4);
+        glDisableVertexAttribArray(5);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glBindVertexArray(0);
+    }
+
+    GLuint debugTestTextureId() const {
+        return debugThumbTex;
+    }
+}
+
+private __gshared DebugTextureBackend cachedDebugTextureBackend;
+
+private DebugTextureBackend currentDebugTextureBackend() {
+    if (cachedDebugTextureBackend is null) {
+        cachedDebugTextureBackend = new DebugTextureBackend();
+    }
+    return cachedDebugTextureBackend;
 }
 
 // ---- source/nlshim/core/render/backends/opengl/mask.d ----
@@ -1104,6 +1040,18 @@ class RenderingBackend(BackendEnum backendType : BackendEnum.OpenGL) {
 
     private PostProcessingShader[] postProcessingStack;
 
+    private GLuint debugVao;
+    private GLuint debugVbo;
+    private GLuint debugIbo;
+    private GLuint debugCurrentVbo;
+    private int debugIndexCount;
+
+    private bool advancedBlending;
+    private bool advancedBlendingCoherent;
+    private bool forceTripleBufferFallback;
+    private int[] viewportWidthStack;
+    private int[] viewportHeightStack;
+
     private RenderResourceHandle[IboKey] iboCache;
 
     private void ensureBlendShadersInitialized() {
@@ -1162,6 +1110,46 @@ class RenderingBackend(BackendEnum backendType : BackendEnum.OpenGL) {
         }
     }
 
+    private void ensureDebugRendererInitialized() {
+        if (debugVao != 0) return;
+        glGenVertexArrays(1, &debugVao);
+        glGenBuffers(1, &debugVbo);
+        glGenBuffers(1, &debugIbo);
+        debugCurrentVbo = debugVbo;
+        debugIndexCount = 0;
+    }
+
+    private GLuint textureId(Texture texture) {
+        if (texture is null) return 0;
+        auto handle = texture.backendHandle();
+        if (handle is null) return 0;
+        return requireGLTexture(handle).id;
+    }
+
+    private void logFboState(string tag) {
+        GLint drawFbo;
+        GLint readFbo;
+        GLint[4] vp;
+        GLint[4] dbufs;
+        glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFbo);
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFbo);
+        glGetIntegerv(GL_VIEWPORT, vp.ptr);
+        foreach (i; 0 .. 4) {
+            glGetIntegerv(GL_DRAW_BUFFER0 + i, &dbufs[i]);
+        }
+        auto status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        GLint err = glGetError();
+        import std.stdio : writefln;
+        writefln("[dc-log] %s drawFbo=%s readFbo=%s drawBufs=%s status=0x%x vp=%s err=%s",
+            tag, drawFbo, readFbo, dbufs, status, vp, err);
+    }
+
+    private void logGlErr(string tag) {
+        GLint err = glGetError();
+        import std.stdio : writefln;
+        writefln("[dc-err] %s glError=%s", tag, err);
+    }
+
     private void renderScene(vec4 area, PostProcessingShader shaderToUse, GLuint albedo, GLuint emissive, GLuint bump) {
         glViewport(0, 0, cast(int)area.z, cast(int)area.w);
 
@@ -1183,7 +1171,10 @@ class RenderingBackend(BackendEnum backendType : BackendEnum.OpenGL) {
         if (ambientLightUniform != -1) shaderToUse.shader.setUniform(ambientLightUniform, inSceneAmbientLight);
 
         GLint fbSizeUniform = shaderToUse.getUniform("fbSize");
-        if (fbSizeUniform != -1) shaderToUse.shader.setUniform(fbSizeUniform, vec2(inViewportWidth[$-1], inViewportHeight[$-1]));
+        int viewportWidth;
+        int viewportHeight;
+        getViewport(viewportWidth, viewportHeight);
+        if (fbSizeUniform != -1) shaderToUse.shader.setUniform(fbSizeUniform, vec2(viewportWidth, viewportHeight));
 
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, albedo);
@@ -1212,9 +1203,49 @@ class RenderingBackend(BackendEnum backendType : BackendEnum.OpenGL) {
         }
     }
 
+    void pushViewport(int width, int height) {
+        viewportWidthStack ~= width;
+        viewportHeightStack ~= height;
+    }
+
+    void popViewport() {
+        if (viewportWidthStack.length > 1) {
+            viewportWidthStack.length = viewportWidthStack.length - 1;
+            viewportHeightStack.length = viewportHeightStack.length - 1;
+        }
+    }
+
+    void setViewport(int width, int height) {
+        if (viewportWidthStack.length == 0) {
+            pushViewport(width, height);
+        } else {
+            if (width == viewportWidthStack[$-1] && height == viewportHeightStack[$-1]) {
+                if (fBuffer != 0) {
+                    resizeViewportTargets(width, height);
+                }
+                return;
+            }
+            viewportWidthStack[$-1] = width;
+            viewportHeightStack[$-1] = height;
+        }
+        if (fBuffer != 0) {
+            resizeViewportTargets(width, height);
+        }
+    }
+
+    void getViewport(out int width, out int height) {
+        if (viewportWidthStack.length == 0) {
+            width = 0;
+            height = 0;
+            return;
+        }
+        width = viewportWidthStack[$-1];
+        height = viewportHeightStack[$-1];
+    }
+
     void initializeRenderer() {
-        // Set the viewport and by extension set the textures
-        inSetViewport(640, 480);
+        // Set a default logical viewport before first explicit size arrives.
+        setViewport(640, 480);
 
         glGenVertexArrays(1, &sceneVAO);
         glGenBuffers(1, &sceneVBO);
@@ -1271,6 +1302,7 @@ class RenderingBackend(BackendEnum backendType : BackendEnum.OpenGL) {
 
         // go back to default fb
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        applyBlendingCapabilities();
     }
 
     void initializePartBackendResources() {
@@ -1506,8 +1538,37 @@ class RenderingBackend(BackendEnum backendType : BackendEnum.OpenGL) {
         return hasKHRBlendEquationAdvancedCoherent;
     }
 
+    void applyBlendingCapabilities() {
+        bool desiredAdvanced = supportsAdvancedBlend() && !forceTripleBufferFallback;
+        bool desiredCoherent = supportsAdvancedBlendCoherent() && !forceTripleBufferFallback;
+        if (desiredCoherent != advancedBlendingCoherent) {
+            setAdvancedBlendCoherent(desiredCoherent);
+        }
+        advancedBlending = desiredAdvanced;
+        advancedBlendingCoherent = desiredCoherent;
+    }
+
+    void setTripleBufferFallback(bool enable) {
+        if (forceTripleBufferFallback == enable) return;
+        forceTripleBufferFallback = enable;
+        applyBlendingCapabilities();
+    }
+
+    bool tripleBufferFallbackEnabled() const {
+        return forceTripleBufferFallback;
+    }
+
+    bool advancedBlendEnabled() const {
+        return advancedBlending;
+    }
+
+    bool advancedBlendCoherentEnabled() const {
+        return advancedBlendingCoherent;
+    }
+
     void setAdvancedBlendCoherent(bool enabled) {
         // Fallback backend: advanced coherent mode is unavailable.
+        advancedBlendingCoherent = enabled;
     }
 
     void setLegacyBlendMode(BlendMode mode) {
@@ -1576,6 +1637,35 @@ class RenderingBackend(BackendEnum backendType : BackendEnum.OpenGL) {
         setLegacyBlendMode(mode);
     }
 
+    private bool isAdvancedBlendMode(BlendMode mode) const {
+        switch(mode) {
+            case BlendMode.Multiply:
+            case BlendMode.Screen:
+            case BlendMode.Overlay:
+            case BlendMode.Darken:
+            case BlendMode.Lighten:
+            case BlendMode.ColorDodge:
+            case BlendMode.ColorBurn:
+            case BlendMode.HardLight:
+            case BlendMode.SoftLight:
+            case BlendMode.Difference:
+            case BlendMode.Exclusion:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private void applyBlendMode(BlendMode mode, bool legacyOnly=false) {
+        if (!advancedBlending || legacyOnly) setLegacyBlendMode(mode);
+        else setAdvancedBlendEquation(mode);
+    }
+
+    private void blendModeBarrier(BlendMode mode) {
+        if (advancedBlending && !advancedBlendingCoherent && isAdvancedBlendMode(mode))
+            issueBlendBarrier();
+    }
+
     void issueBlendBarrier() {
         // no-op when advanced blend barrier is unavailable
     }
@@ -1598,7 +1688,10 @@ class RenderingBackend(BackendEnum backendType : BackendEnum.OpenGL) {
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_CULL_FACE);
 
-        glViewport(0, 0, inViewportWidth[$-1], inViewportHeight[$-1]);
+        int viewportWidth;
+        int viewportHeight;
+        getViewport(viewportWidth, viewportHeight);
+        glViewport(0, 0, viewportWidth, viewportHeight);
 
         glBindFramebuffer(GL_FRAMEBUFFER, fBuffer);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fAlbedo, 0);
@@ -1673,10 +1766,11 @@ class RenderingBackend(BackendEnum backendType : BackendEnum.OpenGL) {
         float r, g, b, a;
         inGetClearColor(r, g, b, a);
 
-        vec4 area = vec4(
-            0, 0,
-            inViewportWidth[$-1], inViewportHeight[$-1]
-        );
+        int viewportWidth;
+        int viewportHeight;
+        getViewport(viewportWidth, viewportHeight);
+
+        vec4 area = vec4(0, 0, viewportWidth, viewportHeight);
 
         float[] data = [
             area.x,         area.y + area.w,          0, 0,
@@ -1717,8 +1811,8 @@ class RenderingBackend(BackendEnum backendType : BackendEnum.OpenGL) {
             glBindFramebuffer(GL_READ_FRAMEBUFFER, cfBuffer);
             glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fBuffer);
             glBlitFramebuffer(
-                0, 0, inViewportWidth[$-1], inViewportHeight[$-1],
-                0, 0, inViewportWidth[$-1], inViewportHeight[$-1],
+                0, 0, viewportWidth, viewportHeight,
+                0, 0, viewportWidth, viewportHeight,
                 GL_COLOR_BUFFER_BIT,
                 GL_LINEAR
             );
@@ -1728,38 +1822,38 @@ class RenderingBackend(BackendEnum backendType : BackendEnum.OpenGL) {
     }
 
     void initDebugRenderer() {
-        ensureInitialized();
+        ensureDebugRendererInitialized();
     }
 
     void uploadDebugBuffer(Vec3Array points, ushort[] indices) {
-        ensureInitialized();
+        ensureDebugRendererInitialized();
         if (points.length == 0 || indices.length == 0) {
-            indexCount = 0;
+            debugIndexCount = 0;
             pointCount = 0;
             bufferIsSoA = false;
             return;
         }
 
-        glBindVertexArray(vao);
-        glUploadFloatVecArray(vbo, points, GL_DYNAMIC_DRAW, "UploadDebug");
-        currentVbo = vbo;
+        glBindVertexArray(debugVao);
+        glUploadFloatVecArray(debugVbo, points, GL_DYNAMIC_DRAW, "UploadDebug");
+        debugCurrentVbo = debugVbo;
         pointCount = cast(int)points.length;
         bufferIsSoA = true;
 
-        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, debugIbo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.length * ushort.sizeof, indices.ptr, GL_DYNAMIC_DRAW);
-        indexCount = cast(int)indices.length;
+        debugIndexCount = cast(int)indices.length;
     }
 
     void setDebugExternalBuffer(RenderResourceHandle vbo, RenderResourceHandle ibo, int count) {
-        ensureInitialized();
+        ensureDebugRendererInitialized();
         auto vertexHandle = cast(GLuint)vbo;
         auto indexHandle = cast(GLuint)ibo;
-        glBindVertexArray(vao);
+        glBindVertexArray(debugVao);
         glBindBuffer(GL_ARRAY_BUFFER, vertexHandle);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, indexHandle);
-        currentVbo = vertexHandle;
-        indexCount = count;
+        debugCurrentVbo = vertexHandle;
+        debugIndexCount = count;
         bufferIsSoA = false;
         pointCount = 0;
     }
@@ -1887,7 +1981,7 @@ class RenderingBackend(BackendEnum backendType : BackendEnum.OpenGL) {
 
                         int viewportWidth;
                         int viewportHeight;
-                        inGetViewport(viewportWidth, viewportHeight);
+                        getViewport(viewportWidth, viewportHeight);
 
                         GLuint blendFramebuffer = blendFBO;
                         glBindFramebuffer(GL_READ_FRAMEBUFFER, prev.drawFbo);
@@ -2003,7 +2097,7 @@ class RenderingBackend(BackendEnum backendType : BackendEnum.OpenGL) {
             pass.hasStencil = false;
         }
 
-        inPushViewport(tex.width, tex.height);
+        pushViewport(tex.width, tex.height);
 
         glDrawBuffers(cast(int)bufferCount, drawBuffers.ptr);
         pass.drawBufferCount = cast(int)bufferCount;
@@ -2031,7 +2125,7 @@ class RenderingBackend(BackendEnum backendType : BackendEnum.OpenGL) {
 
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, cast(GLuint)pass.origBuffer);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, cast(GLuint)pass.origBuffer);
-        inPopViewport();
+        popViewport();
         glViewport(pass.origViewport[0], pass.origViewport[1],
             pass.origViewport[2], pass.origViewport[3]);
         if (pass.origBuffer != 0) {
@@ -2324,9 +2418,6 @@ private:
         glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 0, cast(void*)deformLane1Offset);
 
         drawDrawableElements(packet.indexBuffer, packet.indexCount);
-        markBufferInUse(sharedVbo);
-        markBufferInUse(sharedDbo);
-
         glDisableVertexAttribArray(0);
         glDisableVertexAttribArray(1);
         glDisableVertexAttribArray(2);
@@ -2367,7 +2458,7 @@ private:
                 partShaderStage1.setUniform(gs1opacity, packet.opacity);
                 partShaderStage1.setUniform(gs1MultColor, packet.clampedTint);
                 partShaderStage1.setUniform(gs1ScreenColor, packet.clampedScreen);
-                inSetBlendMode(packet.blendingMode, false);
+                applyBlendMode(packet.blendingMode, false);
                 break;
             case 1:
                 setDrawBuffersSafe(2);
@@ -2378,7 +2469,7 @@ private:
                 partShaderStage2.setUniform(gs2EmissionStrength, packet.emissionStrength);
                 partShaderStage2.setUniform(gs2MultColor, packet.clampedTint);
                 partShaderStage2.setUniform(gs2ScreenColor, packet.clampedScreen);
-                inSetBlendMode(packet.blendingMode, true);
+                applyBlendMode(packet.blendingMode, true);
                 break;
             case 2:
                 setDrawBuffersSafe(3);
@@ -2389,7 +2480,7 @@ private:
                 partShader.setUniform(gEmissionStrength, packet.emissionStrength);
                 partShader.setUniform(gMultColor, packet.clampedTint);
                 partShader.setUniform(gScreenColor, packet.clampedScreen);
-                inSetBlendMode(packet.blendingMode, true);
+                applyBlendMode(packet.blendingMode, true);
                 break;
             default:
                 return;
@@ -2476,10 +2567,6 @@ private:
         glVertexAttribPointer(5, 1, GL_FLOAT, GL_FALSE, 0, cast(void*)deformLane1Offset);
 
         drawDrawableElements(packet.indexBuffer, indexCount);
-        markBufferInUse(vertexBuffer);
-        markBufferInUse(uvBuffer);
-        markBufferInUse(deformBuffer);
-
         glDisableVertexAttribArray(0);
         glDisableVertexAttribArray(1);
         glDisableVertexAttribArray(2);
@@ -2488,7 +2575,7 @@ private:
         glDisableVertexAttribArray(5);
 
         if (advanced) {
-            inBlendModeBarrier(packet.blendingMode);
+            blendModeBarrier(packet.blendingMode);
         }
     }
 
@@ -2917,81 +3004,12 @@ public enum BlendMode {
     SliceFromLower
 }
 
-private bool inAdvancedBlending;
-private bool inAdvancedBlendingCoherent;
-version(OSX)
-    enum bool inDefaultTripleBufferFallback = true;
-else
-    enum bool inDefaultTripleBufferFallback = false;
-private bool inForceTripleBufferFallback = inDefaultTripleBufferFallback;
-private bool inAdvancedBlendingAvailable;
-private bool inAdvancedBlendingCoherentAvailable;
-
-private auto blendBackend() { return currentRenderBackend(); }
-
-
-    void setAdvancedBlendCoherent(bool enabled) { blendBackend().setAdvancedBlendCoherent(enabled); }
-    void setLegacyBlendMode(BlendMode blendingMode) { blendBackend().setLegacyBlendMode(blendingMode); }
-    void setAdvancedBlendEquation(BlendMode blendingMode) { blendBackend().setAdvancedBlendEquation(blendingMode); }
-    void issueBlendBarrier() { blendBackend().issueBlendBarrier(); }
-    bool hasAdvancedBlendSupport() { return blendBackend().supportsAdvancedBlend(); }
-    bool hasAdvancedBlendCoherentSupport() { return blendBackend().supportsAdvancedBlendCoherent(); }
-
-
-private void inApplyBlendingCapabilities() {
-    bool desiredAdvanced = inAdvancedBlendingAvailable && !inForceTripleBufferFallback;
-    bool desiredCoherent = inAdvancedBlendingCoherentAvailable && !inForceTripleBufferFallback;
-
-    if (desiredCoherent != inAdvancedBlendingCoherent) {
-        setAdvancedBlendCoherent(desiredCoherent);
-    }
-
-    inAdvancedBlending = desiredAdvanced;
-    inAdvancedBlendingCoherent = desiredCoherent;
-}
-
-private void inSetBlendModeLegacy(BlendMode blendingMode) {
-    setLegacyBlendMode(blendingMode);
-}
-
 public void nlSetTripleBufferFallback(bool enable) {
-    if (inForceTripleBufferFallback == enable) return;
-    inForceTripleBufferFallback = enable;
-    inApplyBlendingCapabilities();
+    currentRenderBackend().setTripleBufferFallback(enable);
 }
 
 public bool nlIsTripleBufferFallbackEnabled() {
-    return inForceTripleBufferFallback;
-}
-
-public bool inIsAdvancedBlendMode(BlendMode mode) {
-    if (!inAdvancedBlending) return false;
-    switch(mode) {
-        case BlendMode.Multiply:
-        case BlendMode.Screen:
-        case BlendMode.Overlay:
-        case BlendMode.Darken:
-        case BlendMode.Lighten:
-        case BlendMode.ColorDodge:
-        case BlendMode.ColorBurn:
-        case BlendMode.HardLight:
-        case BlendMode.SoftLight:
-        case BlendMode.Difference:
-        case BlendMode.Exclusion:
-            return true;
-        default:
-            return false;
-    }
-}
-
-public void inSetBlendMode(BlendMode blendingMode, bool legacyOnly=false) {
-    if (!inAdvancedBlending || legacyOnly) inSetBlendModeLegacy(blendingMode);
-    else setAdvancedBlendEquation(blendingMode);
-}
-
-public void inBlendModeBarrier(BlendMode mode) {
-    if (inAdvancedBlending && !inAdvancedBlendingCoherent && inIsAdvancedBlendMode(mode))
-        issueBlendBarrier();
+    return currentRenderBackend().tripleBufferFallbackEnabled();
 }
 
 // ===== Drawable helpers =====
@@ -3012,8 +3030,6 @@ import fghj : deserializeValue;
 import std.exception : enforce;
 import core.stdc.string : memcpy;
 
-public int[] inViewportWidth;
-public int[] inViewportHeight;
 public vec4 inClearColor = vec4(0, 0, 0, 0);
 vec3 inSceneAmbientLight = vec3(1, 1, 1);
 
@@ -3031,46 +3047,26 @@ public void inSetRenderBackend(RenderBackend backend) {
 
 /// Push viewport dimensions.
 void inPushViewport(int width, int height) {
-    inViewportWidth ~= width;
-    inViewportHeight ~= height;
+    requireRenderBackend().pushViewport(width, height);
 }
 
 /// Pop viewport if we have more than one entry.
 void inPopViewport() {
-    if (inViewportWidth.length > 1) {
-        inViewportWidth.length = inViewportWidth.length - 1;
-        inViewportHeight.length = inViewportHeight.length - 1;
-    }
+    requireRenderBackend().popViewport();
 }
 
 /**
     Sets the viewport dimensions (logical state + backend notification)
 */
 void inSetViewport(int width, int height) {
-    if (inViewportWidth.length == 0) {
-        inPushViewport(width, height);
-    } else {
-        if (width == inViewportWidth[$-1] && height == inViewportHeight[$-1]) {
-            requireRenderBackend().resizeViewportTargets(width, height);
-            return;
-        }
-        inViewportWidth[$-1] = width;
-        inViewportHeight[$-1] = height;
-    }
-    requireRenderBackend().resizeViewportTargets(width, height);
+    requireRenderBackend().setViewport(width, height);
 }
 
 /**
     Gets the current viewport dimensions.
 */
 void inGetViewport(out int width, out int height) {
-    if (inViewportWidth.length == 0) {
-        width = 0;
-        height = 0;
-        return;
-    }
-    width = inViewportWidth[$-1];
-    height = inViewportHeight[$-1];
+    requireRenderBackend().getViewport(width, height);
 }
 
 /// Clear color getter.
@@ -3652,11 +3648,6 @@ private int legacyColorModeFromChannels(int channels) {
         case 3: return LegacyGLRgb;
         default: return LegacyGLRgba;
     }
-}
-
-private {
-    Texture[] textureBindings;
-    bool started = false;
 }
 
 /**

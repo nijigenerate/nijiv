@@ -20,7 +20,6 @@ import opengl.opengl_backend : initOpenGLBackend, OpenGLBackendInit;
 import opengl.opengl_backend : currentRenderBackend;
 import core.runtime : Runtime;
 import opengl.opengl_backend : inSetUpdateBounds;
-import opengl.opengl_backend : inSetViewport;
 enum MaskDrawableKind : uint { Part, Mask }
 
 extern(C) alias NjgLogFn = void function(const(char)* message, size_t length, void* userData);
@@ -194,8 +193,7 @@ void main(string[] args) {
     FrameConfig frameCfg;
     frameCfg.viewportWidth = glInit.drawableW;
     frameCfg.viewportHeight = glInit.drawableH;
-    inSetViewport(glInit.drawableW, glInit.drawableH);
-    currentRenderBackend().resizeViewportTargets(glInit.drawableW, glInit.drawableH);
+    currentRenderBackend().setViewport(glInit.drawableW, glInit.drawableH);
     float puppetScale = 0.12f;
 
     // Apply initial scale (default 0.25) so that the view starts zoomed out.
@@ -225,8 +223,7 @@ void main(string[] args) {
                         SDL_GL_GetDrawableSize(glInit.window, &glInit.drawableW, &glInit.drawableH);
                         frameCfg.viewportWidth = glInit.drawableW;
                         frameCfg.viewportHeight = glInit.drawableH;
-                        inSetViewport(glInit.drawableW, glInit.drawableH);
-                        currentRenderBackend().resizeViewportTargets(glInit.drawableW, glInit.drawableH);
+                        currentRenderBackend().setViewport(glInit.drawableW, glInit.drawableH);
                     }
                     break;
                 case SDL_MOUSEWHEEL:

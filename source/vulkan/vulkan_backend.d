@@ -16,7 +16,7 @@ import erupted.types;
 
 import nijilive.core.render.backends : BackendEnum;
 import nijilive.core.render.backends.vulkan : RenderingBackend;
-import nijilive.core.runtime_state : inSetRenderBackend, inSetViewport;
+import nijilive.core.runtime_state : inSetRenderBackend;
 import nijilive : inInit;
 
 struct VulkanBackendInit {
@@ -114,7 +114,7 @@ VulkanBackendInit initVulkanBackend(int width, int height, bool isTest) {
     int drawableW = width;
     int drawableH = height;
     SDL_Vulkan_GetDrawableSize(window, &drawableW, &drawableH);
-    inSetViewport(drawableW, drawableH);
+    backend.setViewport(drawableW, drawableH);
     return VulkanBackendInit(window, backend, drawableW, drawableH);
 }
 
