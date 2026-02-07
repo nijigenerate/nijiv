@@ -2143,7 +2143,6 @@ extern(C) struct NjgPartDrawPacket {
     bool renderable;
     float[16] modelMatrix;
     float[16] renderMatrix;
-    vec2 renderScale;
     float renderRotation;
     vec3 clampedTint;
     vec3 clampedScreen;
@@ -2196,6 +2195,8 @@ extern(C) struct NjgDynamicCompositePass {
     bool autoScaled;
     RenderResourceHandle origBuffer;
     int[4] origViewport;
+    int drawBufferCount;
+    bool hasStencil;
 }
 
 extern(C) struct NjgQueuedCommand {
