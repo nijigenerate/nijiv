@@ -22,6 +22,10 @@ version (EnableVulkanBackend) {
     import gfx = vulkan_backend;
     enum backendName = "vulkan";
     alias BackendInit = gfx.VulkanBackendInit;
+} else version (EnableDirectXBackend) {
+    import gfx = directx.directx_backend;
+    enum backendName = "directx";
+    alias BackendInit = gfx.DirectXBackendInit;
 } else {
     import bindbc.opengl;
     import gfx = opengl.opengl_backend;
@@ -177,6 +181,14 @@ string resolvePuppetPath(string rawPath) {
     return rawPath;
 }
 
+bool isEnvEnabled(string name) {
+    import core.stdc.stdlib : getenv;
+    auto p = getenv(name.toStringz);
+    if (p is null) return false;
+    auto v = fromStringz(p).idup;
+    return v == "1" || v == "true" || v == "TRUE";
+}
+
 void main(string[] args) {
     bool isTest = false;
     string[] positional;
@@ -240,6 +252,14 @@ void main(string[] args) {
             SDL_Quit();
         }
         SDL_Vulkan_GetDrawableSize(backendInit.window, &backendInit.drawableW, &backendInit.drawableH);
+    } else version (EnableDirectXBackend) {
+        backendInit = gfx.initDirectXBackend(width, height, isTest);
+        scope (exit) {
+            if (backendInit.backend !is null) backendInit.backend.dispose();
+            if (backendInit.window !is null) SDL_DestroyWindow(backendInit.window);
+            SDL_Quit();
+        }
+        SDL_GetWindowSize(backendInit.window, &backendInit.drawableW, &backendInit.drawableH);
     } else {
         backendInit = gfx.initOpenGLBackend(width, height, isTest);
         scope (exit) {
@@ -293,6 +313,8 @@ void main(string[] args) {
     frameCfg.viewportHeight = backendInit.drawableH;
     version (EnableVulkanBackend) {
         backendInit.backend.setViewport(backendInit.drawableW, backendInit.drawableH);
+    } else version (EnableDirectXBackend) {
+        backendInit.backend.setViewport(backendInit.drawableW, backendInit.drawableH);
     } else {
         currentRenderBackend().setViewport(backendInit.drawableW, backendInit.drawableH);
     }
@@ -326,6 +348,11 @@ void main(string[] args) {
                         ev.window.event == SDL_WINDOWEVENT_RESIZED) {
                         version (EnableVulkanBackend) {
                             SDL_Vulkan_GetDrawableSize(backendInit.window, &backendInit.drawableW, &backendInit.drawableH);
+                            frameCfg.viewportWidth = backendInit.drawableW;
+                            frameCfg.viewportHeight = backendInit.drawableH;
+                            backendInit.backend.setViewport(backendInit.drawableW, backendInit.drawableH);
+                        } else version (EnableDirectXBackend) {
+                            SDL_GetWindowSize(backendInit.window, &backendInit.drawableW, &backendInit.drawableH);
                             frameCfg.viewportWidth = backendInit.drawableW;
                             frameCfg.viewportHeight = backendInit.drawableH;
                             backendInit.backend.setViewport(backendInit.drawableW, backendInit.drawableH);
@@ -366,17 +393,17 @@ void main(string[] args) {
 
         gfx.CommandQueueView view;
         enforce(api.emitCommands(renderer, &view) == gfx.NjgResult.Ok, "njgEmitCommands failed");
-        if (view.count && frameCount % 60 == 0) {
-            writefln("Frame %s: queued commands=%s", frameCount, view.count);
-        }
-
         gfx.SharedBufferSnapshot snapshot;
         enforce(api.getSharedBuffers(renderer, &snapshot) == gfx.NjgResult.Ok, "njgGetSharedBuffers failed");
 
         gfx.renderCommands(&backendInit, &snapshot, &view);
 
-        api.flushCommands(renderer);
+        if (isEnvEnabled("NJIV_SKIP_FLUSH")) {
+        } else {
+            api.flushCommands(renderer);
+        }
         version (EnableVulkanBackend) {
+        } else version (EnableDirectXBackend) {
         } else {
             SDL_GL_SwapWindow(backendInit.window);
         }
@@ -393,6 +420,23 @@ void main(string[] args) {
         }
     }
 
+    version (EnableDirectXBackend) {
+        gfx.shutdownDirectXBackend(backendInit);
+    } else version (EnableVulkanBackend) {
+        if (backendInit.backend !is null) {
+            backendInit.backend.dispose();
+        }
+    }
+
     api.unloadPuppet(renderer, puppet);
     api.destroyRenderer(renderer);
+    if (api.rtTerm !is null) {
+        api.rtTerm();
+    }
+    Runtime.unloadLibrary(api.lib);
+
+    version (EnableDirectXBackend) {
+        import core.stdc.stdlib : _Exit;
+        _Exit(0);
+    }
 }

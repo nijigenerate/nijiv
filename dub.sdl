@@ -27,5 +27,14 @@ configuration "vulkan" {
     targetName "nijiv-vulkan"
     dependency "erupted" version="*"
     versions "EnableVulkanBackend"
-    excludedSourceFiles "source/opengl/**"
+    excludedSourceFiles "source/opengl/**" "source/directx/**"
+}
+
+configuration "directx" {
+    platforms "windows"
+    targetName "nijiv-directx"
+    dependency "aurora-directx" version="~>12.1.2+10.0.17763.0"
+    versions "EnableDirectXBackend"
+    lflags "d3d12.lib" "dxgi.lib" "dxguid.lib" "d3dcompiler.lib"
+    excludedSourceFiles "source/opengl/**" "source/vulkan/**"
 }
