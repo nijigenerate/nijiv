@@ -442,6 +442,7 @@ private:
     bool clearActiveTarget;
     bool maskBuildActive;
     bool maskContentActive;
+    bool maskStencilAvailable;
     bool pendingMaskStencilClear;
     uint32_t pendingMaskStencilClearValue = 1;
     uint32_t pendingMaskWriteReference = 1;
@@ -568,6 +569,7 @@ public:
         clearActiveTarget = false;
         maskBuildActive = false;
         maskContentActive = false;
+        maskStencilAvailable = false;
         pendingMaskStencilClear = false;
         pendingMaskStencilClearValue = 1;
         pendingMaskWriteReference = 1;
@@ -582,6 +584,14 @@ public:
     }
 
     void beginMask(bool useStencil) {
+        // Current Vulkan backend only has stencil attachment on the root swapchain target.
+        maskStencilAvailable = (activeTargetCount == 0 || activeTargetHandles[0] == 0);
+        if (!maskStencilAvailable) {
+            maskBuildActive = false;
+            maskContentActive = false;
+            pendingMaskStencilClear = false;
+            return;
+        }
         maskBuildActive = true;
         maskContentActive = false;
         pendingMaskStencilClear = true;
@@ -589,7 +599,7 @@ public:
     }
 
     void applyMask(ref const(NjgMaskApplyPacket) packet, Texture[size_t] texturesByHandle) {
-        if (!maskBuildActive) return;
+        if (!maskBuildActive || !maskStencilAvailable) return;
         pendingMaskWriteReference = packet.isDodge ? 0u : 1u;
         if (packet.kind == MaskDrawableKind.Part) {
             drawPartPacket(packet.partPacket, texturesByHandle);
@@ -599,6 +609,11 @@ public:
     }
 
     void beginMaskContent() {
+        if (!maskStencilAvailable) {
+            maskBuildActive = false;
+            maskContentActive = false;
+            return;
+        }
         maskBuildActive = false;
         maskContentActive = true;
     }
@@ -606,6 +621,7 @@ public:
     void endMask() {
         maskBuildActive = false;
         maskContentActive = false;
+        maskStencilAvailable = false;
         pendingMaskStencilClear = false;
     }
 
@@ -643,7 +659,7 @@ public:
     void drawPartPacket(ref const(NjgPartDrawPacket) packet,
                         Texture[size_t] texturesByHandle)
     {
-        if (!packet.renderable || packet.indexCount == 0 || packet.vertexCount == 0) return;
+        if (packet.indexCount == 0 || packet.vertexCount == 0) return;
         if (currentSnapshot is null) return;
 
         auto vertices = currentSnapshot.vertices;
@@ -1211,9 +1227,10 @@ private:
         ds.samples = VK_SAMPLE_COUNT_1_BIT;
         ds.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         ds.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        ds.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        ds.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        ds.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        // Keep stencil across root render passes in the same frame.
+        ds.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        ds.stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+        ds.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         ds.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
         VkAttachmentReference dsRef;
@@ -1416,7 +1433,11 @@ private:
         viewportState.scissorCount = 1;
         viewportState.pScissors = &scissor;
 
-        VkDynamicState[2] dynamicStates = [VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR];
+        VkDynamicState[3] dynamicStates = [
+            VK_DYNAMIC_STATE_VIEWPORT,
+            VK_DYNAMIC_STATE_SCISSOR,
+            VK_DYNAMIC_STATE_STENCIL_REFERENCE
+        ];
         VkPipelineDynamicStateCreateInfo dynamicInfo;
         dynamicInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
         dynamicInfo.dynamicStateCount = cast(uint32_t)dynamicStates.length;
@@ -1520,71 +1541,111 @@ private:
         s.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
         s.alphaBlendOp = VK_BLEND_OP_ADD;
 
+        auto setBlendFunc = (VkBlendFactor src, VkBlendFactor dst) {
+            s.srcColorBlendFactor = src;
+            s.dstColorBlendFactor = dst;
+            s.srcAlphaBlendFactor = src;
+            s.dstAlphaBlendFactor = dst;
+        };
+        auto setBlendFuncSeparate = (VkBlendFactor srcColor,
+                                     VkBlendFactor dstColor,
+                                     VkBlendFactor srcAlpha,
+                                     VkBlendFactor dstAlpha) {
+            s.srcColorBlendFactor = srcColor;
+            s.dstColorBlendFactor = dstColor;
+            s.srcAlphaBlendFactor = srcAlpha;
+            s.dstAlphaBlendFactor = dstAlpha;
+        };
+
         final switch (mode) {
             case BlendMode.Normal:
+                s.colorBlendOp = VK_BLEND_OP_ADD;
+                s.alphaBlendOp = VK_BLEND_OP_ADD;
+                setBlendFunc(VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
                 break;
             case BlendMode.Multiply:
-                s.srcColorBlendFactor = VK_BLEND_FACTOR_DST_COLOR;
-                s.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+                s.colorBlendOp = VK_BLEND_OP_ADD;
+                s.alphaBlendOp = VK_BLEND_OP_ADD;
+                setBlendFunc(VK_BLEND_FACTOR_DST_COLOR, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
                 break;
             case BlendMode.Screen:
-                s.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
-                s.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+                s.colorBlendOp = VK_BLEND_OP_ADD;
+                s.alphaBlendOp = VK_BLEND_OP_ADD;
+                setBlendFunc(VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR);
                 break;
             case BlendMode.Overlay:
-            case BlendMode.Darken:
-            case BlendMode.Lighten:
             case BlendMode.ColorBurn:
             case BlendMode.HardLight:
             case BlendMode.SoftLight:
             case BlendMode.Difference:
                 // Legacy fallback path: approximate unsupported equations.
-                s.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
-                s.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+                s.colorBlendOp = VK_BLEND_OP_ADD;
+                s.alphaBlendOp = VK_BLEND_OP_ADD;
+                setBlendFunc(VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
+                break;
+            case BlendMode.Darken:
+                s.colorBlendOp = VK_BLEND_OP_MIN;
+                s.alphaBlendOp = VK_BLEND_OP_ADD;
+                setBlendFunc(VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE);
+                break;
+            case BlendMode.Lighten:
+                s.colorBlendOp = VK_BLEND_OP_MAX;
+                s.alphaBlendOp = VK_BLEND_OP_ADD;
+                setBlendFunc(VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE);
                 break;
             case BlendMode.ColorDodge:
-                s.srcColorBlendFactor = VK_BLEND_FACTOR_DST_COLOR;
-                s.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+                s.colorBlendOp = VK_BLEND_OP_ADD;
+                s.alphaBlendOp = VK_BLEND_OP_ADD;
+                setBlendFunc(VK_BLEND_FACTOR_DST_COLOR, VK_BLEND_FACTOR_ONE);
                 break;
             case BlendMode.LinearDodge:
-                s.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
-                s.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
-                s.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-                s.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+                s.colorBlendOp = VK_BLEND_OP_ADD;
+                s.alphaBlendOp = VK_BLEND_OP_ADD;
+                setBlendFuncSeparate(VK_BLEND_FACTOR_ONE,
+                                     VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR,
+                                     VK_BLEND_FACTOR_ONE,
+                                     VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
                 break;
             case BlendMode.AddGlow:
-                s.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
-                s.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
-                s.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-                s.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+                s.colorBlendOp = VK_BLEND_OP_ADD;
+                s.alphaBlendOp = VK_BLEND_OP_ADD;
+                setBlendFuncSeparate(VK_BLEND_FACTOR_ONE,
+                                     VK_BLEND_FACTOR_ONE,
+                                     VK_BLEND_FACTOR_ONE,
+                                     VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
                 break;
             case BlendMode.Exclusion:
-                s.srcColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
-                s.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
-                s.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-                s.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+                s.colorBlendOp = VK_BLEND_OP_ADD;
+                s.alphaBlendOp = VK_BLEND_OP_ADD;
+                setBlendFuncSeparate(VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR,
+                                     VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR,
+                                     VK_BLEND_FACTOR_ONE,
+                                     VK_BLEND_FACTOR_ONE);
                 break;
             case BlendMode.Subtract:
                 s.colorBlendOp = VK_BLEND_OP_REVERSE_SUBTRACT;
                 s.alphaBlendOp = VK_BLEND_OP_ADD;
-                s.srcColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
-                s.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+                setBlendFunc(VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR, VK_BLEND_FACTOR_ONE);
                 break;
             case BlendMode.Inverse:
-                s.srcColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
-                s.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+                s.colorBlendOp = VK_BLEND_OP_ADD;
+                s.alphaBlendOp = VK_BLEND_OP_ADD;
+                setBlendFunc(VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
                 break;
             case BlendMode.DestinationIn:
-                s.srcColorBlendFactor = VK_BLEND_FACTOR_ZERO;
-                s.dstColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+                s.colorBlendOp = VK_BLEND_OP_ADD;
+                s.alphaBlendOp = VK_BLEND_OP_ADD;
+                setBlendFunc(VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_SRC_ALPHA);
                 break;
             case BlendMode.ClipToLower:
-                s.srcColorBlendFactor = VK_BLEND_FACTOR_DST_ALPHA;
-                s.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+                s.colorBlendOp = VK_BLEND_OP_ADD;
+                s.alphaBlendOp = VK_BLEND_OP_ADD;
+                setBlendFunc(VK_BLEND_FACTOR_DST_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
                 break;
             case BlendMode.SliceFromLower:
-                s.srcColorBlendFactor = VK_BLEND_FACTOR_ZERO;
-                s.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+                s.colorBlendOp = VK_BLEND_OP_ADD;
+                s.alphaBlendOp = VK_BLEND_OP_ADD;
+                setBlendFunc(VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA);
                 break;
             case BlendMode.Count:
                 break;
@@ -2103,10 +2164,11 @@ private:
 
             VkViewport vp;
             vp.x = 0;
-            // Match OpenGL-style screen orientation by flipping Vulkan viewport Y.
-            vp.y = cast(float)extent.height;
+            // Root/swapchain pass uses flipped Y to match OpenGL presentation.
+            // Offscreen (dynamic composite targets) stays unflipped.
+            vp.y = offscreen ? 0.0f : cast(float)extent.height;
             vp.width = cast(float)extent.width;
-            vp.height = -cast(float)extent.height;
+            vp.height = offscreen ? cast(float)extent.height : -cast(float)extent.height;
             vp.minDepth = 0;
             vp.maxDepth = 1;
             vkCmdSetViewport(cmd, 0, 1, &vp);
