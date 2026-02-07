@@ -93,6 +93,18 @@ extern(C) void logCallback(const(char)* msg, size_t len, void* userData) {
     writeln("[nijilive-unity] "~msg[0 .. len].idup);
 }
 
+string[] unityLibraryNames() {
+    version (Windows) {
+        return ["nijilive-unity.dll", "libnijilive-unity.dll"];
+    } else version (linux) {
+        return ["libnijilive-unity.so", "nijilive-unity.so"];
+    } else version (OSX) {
+        return ["libnijilive-unity.dylib", "nijilive-unity.dylib"];
+    } else {
+        return ["libnijilive-unity"];
+    }
+}
+
 void main(string[] args) {
     bool isTest = false;
     string[] positional;
@@ -157,12 +169,14 @@ void main(string[] args) {
 
     // Load the Unity-facing DLL from a nearby nijilive build.
     string exeDir = getcwd();
-    string[] libCandidates = [
-        buildPath(exeDir, "libnijilive-unity.dylib"),
-        buildPath(exeDir, "..", "nijilive", "libnijilive-unity.dylib"),
-        buildPath(exeDir, "..", "..", "nijilive", "libnijilive-unity.dylib"),
-        buildPath("..", "nijilive", "libnijilive-unity.dylib"),
-    ];
+    auto libNames = unityLibraryNames();
+    string[] libCandidates;
+    foreach (name; libNames) {
+        libCandidates ~= buildPath(exeDir, name);
+        libCandidates ~= buildPath(exeDir, "..", "nijilive", name);
+        libCandidates ~= buildPath(exeDir, "..", "..", "nijilive", name);
+        libCandidates ~= buildPath("..", "nijilive", name);
+    }
     string libPath;
     foreach (c; libCandidates) {
         if (exists(c)) {
@@ -170,7 +184,7 @@ void main(string[] args) {
             break;
         }
     }
-    enforce(libPath.length > 0, "Could not find libnijilive-unity.dylib (searched: "~libCandidates.to!string~")");
+    enforce(libPath.length > 0, "Could not find nijilive unity library (searched: "~libCandidates.to!string~")");
     auto api = loadUnityApi(libPath);
     // Do not unload the shared runtime-bound DLL during process lifetime.
     if (api.rtInit !is null) api.rtInit();
