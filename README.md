@@ -1,44 +1,53 @@
 # nijiv
 
-`nijiv` is a sample viewer that renders nijilive puppets via the **nijilive Unity DLL interface**.
+`nijiv` is a sample host viewer that renders nijilive puppets through the **nijilive Unity DLL ABI (`njg*`)**.
 
-This project focuses on the "host side" implementation:
-- loading `libnijilive-unity` and calling exported `njg*` APIs
-- creating an SDL2 + OpenGL context
-- receiving command queues/shared buffers from the DLL
-- executing rendering on the host side
+This repository focuses on host-side integration:
+- load `libnijilive-unity` and bind exported C ABI symbols
+- create rendering context (SDL2 + OpenGL or Vulkan)
+- receive command queue/shared buffers from DLL
+- execute rendering on the host backend
 
-## Purpose
+## Backends
 
-This repository is intended as a practical reference for integrating nijilive through the Unity-facing C ABI, rather than as a full engine/runtime.
+- OpenGL backend: `source/opengl/opengl_backend.d`
+- Vulkan backend: `source/vulkan/vulkan_backend.d`
 
-## Current Scope
+Both are selectable with DUB configurations.
 
-- Rendering backend: OpenGL (`source/opengl/opengl_backend.d`)
-- Debug texture thumbnails: separated module (`source/opengl/opengl_thumb.d`)
-- Main entry point: `source/app.d`
+## DUB Configurations
 
-A Vulkan-related file exists in `source/vulkan/`, but the current executable path is OpenGL-based.
+- `opengl`
+  - target: `nijiv-opengl`
+  - backend dependency: `bindbc-opengl`
+  - excludes: `source/vulkan/**`
+- `vulkan`
+  - target: `nijiv-vulkan`
+  - backend dependency: `erupted`
+  - version flag: `EnableVulkanBackend`
+  - excludes: `source/opengl/**`
+
+Common dependencies are kept at package root (SDL, math/image/support libs).
 
 ## Requirements
 
 - D toolchain (`ldc2` recommended)
 - `dub`
-- SDL2 runtime library
-- `libnijilive-unity.dylib` (built from nijilive side)
-- Puppet file (`.inp` or `.inx`)
+- SDL2 runtime
+- nijilive Unity library (`libnijilive-unity*`)
+- puppet file (`.inp` or `.inx`)
+
+Vulkan runtime requirements:
+- Vulkan loader + ICD (MoltenVK on macOS)
+- a valid Vulkan SDK/runtime environment when running `nijiv-vulkan`
 
 ## Build Order
 
-Build in this order:
+1. Build nijilive Unity DLL (`libnijilive-unity*`)
+2. Build `nijiv` backend (`opengl` or `vulkan`)
+3. Run viewer
 
-1. Build `nijilive` Unity DLL (`libnijilive-unity*`)
-2. Build `nijiv`
-3. Run `nijiv`
-
-## Build `libnijilive-unity` (DLL/.so/.dylib)
-
-`nijiv` consumes the Unity-facing exported `njg*` API from the sibling `nijilive` project.
+## Build nijilive Unity DLL
 
 Expected layout:
 
@@ -56,13 +65,11 @@ In `../nijilive`:
 ./build-aux/osx/buildUnityDLL.sh
 ```
 
-or directly:
+or:
 
 ```bash
 dub build --config unity-dll-macos
 ```
-
-This produces `nijilive-unity.dylib` (typically as `libnijilive-unity.dylib` in the project root).
 
 ### Windows
 
@@ -78,93 +85,73 @@ or:
 dub build --config unity-dll
 ```
 
-This produces `nijilive-unity.dll` (plus import library files).
-
 ### Linux
 
-At the moment, `nijilive` has dedicated Unity DLL configs for:
-- `unity-dll` (Windows)
-- `unity-dll-macos` (macOS)
+If `nijilive` does not provide a Linux unity-dll config in your checkout, prepare an equivalent `.so` build path on the nijilive side first.
 
-There is no dedicated Linux Unity-DLL config in `nijilive/dub.sdl` yet, so `.so` generation for this interface is not standardized in this sample workflow.
+## Build nijiv
 
-## Build `nijiv`
+OpenGL:
 
 ```bash
-dub build
+dub build --config=opengl
 ```
 
-Binary name is `nijiv`.
+Vulkan:
+
+```bash
+dub build --config=vulkan
+```
 
 ## Run
 
-```bash
-./nijiv <puppet.inp|puppet.inx> [width height] [--test] [--frames N]
-```
-
-Examples:
+OpenGL:
 
 ```bash
-./nijiv ./sample.inx
-./nijiv ./sample.inx 1920 1080
-./nijiv ./sample.inx --test --frames 10
+./nijiv-opengl <puppet.inp|puppet.inx> [width height] [--test] [--frames N]
 ```
 
-## DLL Search Paths
+Vulkan:
 
-`source/app.d` now resolves library names by OS:
+```bash
+./nijiv-vulkan <puppet.inp|puppet.inx> [width height] [--test] [--frames N]
+```
 
-- Windows: `nijilive-unity.dll` (and `libnijilive-unity.dll` fallback)
-- Linux: `libnijilive-unity.so` (and `nijilive-unity.so` fallback)
-- macOS: `libnijilive-unity.dylib` (and `nijilive-unity.dylib` fallback)
+Notes:
+- If `.inxd` is passed by mistake, the app attempts fallback to `.inx` / `.inp` with the same stem.
 
-For each name, these directories are searched in order:
+## DLL Search
 
-1. executable working directory
+`source/app.d` resolves Unity library names per OS:
+
+- Windows: `nijilive-unity.dll`, `libnijilive-unity.dll`
+- Linux: `libnijilive-unity.so`, `nijilive-unity.so`
+- macOS: `libnijilive-unity.dylib`, `nijilive-unity.dylib`
+
+Search order:
+1. current working directory
 2. `../nijilive`
 3. `../../nijilive`
 4. relative `../nijilive`
 
-If not found, startup fails with an `enforce` error.
-
-## Platform Status (nijiv host app)
-
-Current `nijiv` host loading path supports multi-OS library names in `source/app.d`.
-The OpenGL backend still contains a macOS-specific SDL fallback path (`/opt/homebrew/lib/libSDL2-2.0.0.dylib`), so runtime validation remains strongest on macOS.
-
-### What is needed for Windows/Linux host support
-
-1. OS-appropriate SDL loading fallback paths in `source/opengl/opengl_backend.d`
-2. (Linux) a dedicated `nijilive` unity-dll config for `.so` output, or equivalent documented build path
-
 ## Runtime Options
 
 CLI:
-- `--test`: run in test mode
-- `--frames N`: max frames in test mode
+- `--test`
+- `--frames N`
 
 Environment variables:
-- `NJIV_TEST_FRAMES`: test-mode frame cap
-- `NJIV_TEST_TIMEOUT_MS`: test-mode timeout in milliseconds
+- `NJIV_TEST_FRAMES`
+- `NJIV_TEST_TIMEOUT_MS`
 
-Mouse:
-- mouse wheel changes puppet scale (`njgSetPuppetScale`)
+## Vulkan Status
 
-## Rendering Flow (high level)
+Vulkan backend is actively being brought to parity with OpenGL.
+Current implementation includes:
+- command queue execution
+- texture upload and draw batching
+- blend mode table (including advanced equation path when extension is available)
+- mask/stencil path under active refinement
 
-1. Initialize SDL2/OpenGL
-2. Load Unity DLL and bind `njg*` symbols
-3. Create renderer/puppet via DLL
-4. Per frame:
-   - `njgBeginFrame`
-   - `njgTickPuppet`
-   - `njgEmitCommands`
-   - `njgGetSharedBuffers`
-   - `renderCommands(...)` executes command queue on OpenGL backend
-   - `njgFlushCommandBuffer`
-   - swap window buffers
+If rendering differs from OpenGL on specific assets, treat Vulkan as work-in-progress and verify against `opengl` configuration.
 
-## Notes
-
-- This is a sample/reference project, so implementation is intentionally direct and integration-oriented.
-- Some build warnings may appear depending on local dependency versions and import-path settings.
