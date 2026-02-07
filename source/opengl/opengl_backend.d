@@ -568,7 +568,7 @@ class RenderingBackend {
         size_t offset;
         size_t count;
         size_t capacity;
-        ushort[] data;
+        const(ushort)[] data;
     }
 
     private int pointCount;
@@ -836,7 +836,7 @@ public:
         RenderResourceHandle ibo;
         createDrawableBuffers(ibo);
         auto idxSlice = indices[0 .. count];
-        uploadDrawableIndices(ibo, idxSlice.dup);
+        uploadDrawableIndices(ibo, idxSlice);
         iboCache[key] = ibo;
         return ibo;
     }
@@ -1061,6 +1061,68 @@ public:
         glBlendEquation(GL_FUNC_ADD);
     }
 
+    void drawPartPacket(ref const(NjgPartDrawPacket) packet, Texture[size_t] texturesByHandle) {
+        if (packet.textureCount == 0) return;
+
+        bindDrawableVao();
+
+        Texture currentAlbedo = null;
+        if (auto tex = packet.textureHandles[0] in texturesByHandle) {
+            currentAlbedo = *tex;
+        }
+        if (boundAlbedo !is currentAlbedo) {
+            auto textureCount = min(packet.textureCount, packet.textureHandles.length);
+            foreach (i; 0 .. textureCount) {
+                auto handle = packet.textureHandles[i];
+                if (auto tex = handle in texturesByHandle) {
+                    if (*tex !is null) {
+                        (*tex).bind(cast(uint)i);
+                    } else {
+                        glActiveTexture(GL_TEXTURE0 + cast(uint)i);
+                        glBindTexture(GL_TEXTURE_2D, 0);
+                    }
+                } else {
+                    glActiveTexture(GL_TEXTURE0 + cast(uint)i);
+                    glBindTexture(GL_TEXTURE_2D, 0);
+                }
+            }
+            boundAlbedo = currentAlbedo;
+        }
+
+        auto matrix = *cast(mat4*)&packet.modelMatrix;
+        auto renderMatrix = *cast(mat4*)&packet.renderMatrix;
+
+        if (packet.isMask) {
+            mat4 mvpMatrix = renderMatrix * matrix;
+
+            partMaskShader.use();
+            partMaskShader.setUniform(offset, *cast(vec2*)&packet.origin);
+            partMaskShader.setUniform(mmvp, mvpMatrix);
+            partMaskShader.setUniform(mthreshold, packet.maskThreshold);
+
+            glBlendEquation(GL_FUNC_ADD);
+            glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+
+            renderStage(packet, false);
+        } else {
+            if (packet.useMultistageBlend) {
+                setupShaderStage(packet, 0, matrix, renderMatrix);
+                renderStage(packet, true);
+
+                if (packet.hasEmissionOrBumpmap) {
+                    setupShaderStage(packet, 1, matrix, renderMatrix);
+                    renderStage(packet, false);
+                }
+            } else {
+                setupShaderStage(packet, 2, matrix, renderMatrix);
+                renderStage(packet, false);
+            }
+        }
+
+        glDrawBuffers(3, [GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2].ptr);
+        glBlendEquation(GL_FUNC_ADD);
+    }
+
     void beginDynamicComposite(DynamicCompositePass pass) {
         if (pass is null) {
             return;
@@ -1175,6 +1237,25 @@ public:
         final switch (packet.kind) {
             case MaskDrawableKind.Part:
                 drawPartPacket(packet.partPacket);
+                break;
+            case MaskDrawableKind.Mask:
+                executeMaskPacket(packet.maskPacket);
+                break;
+        }
+
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    }
+
+    void applyMask(ref const(NjgMaskApplyPacket) packet, Texture[size_t] texturesByHandle) {
+        ensureMaskBackendInitialized();
+        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+        glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+        glStencilFunc(GL_ALWAYS, packet.isDodge ? 0 : 1, 0xFF);
+        glStencilMask(0xFF);
+
+        final switch (packet.kind) {
+            case MaskDrawableKind.Part:
+                drawPartPacket(packet.partPacket, texturesByHandle);
                 break;
             case MaskDrawableKind.Mask:
                 executeMaskPacket(packet.maskPacket);
@@ -1396,7 +1477,7 @@ private:
         }
     }
 
-    void uploadDrawableIndices(RenderResourceHandle ibo, ushort[] indices) {
+    void uploadDrawableIndices(RenderResourceHandle ibo, const(ushort)[] indices) {
         if (ibo == 0 || indices.length == 0) return;
         auto bytes = cast(size_t)indices.length * ushort.sizeof;
         ensureSharedIndexBuffer(bytes + sharedIndexOffset);
@@ -1698,6 +1779,51 @@ private:
         glDisableVertexAttribArray(3);
     }
 
+    void executeMaskPacket(ref const(NjgMaskDrawPacket) packet) {
+        ensureMaskBackendInitialized();
+        if (packet.indexCount == 0) return;
+
+        bindDrawableVao();
+
+        maskShader.use();
+        maskShader.setUniform(maskOffsetUniform, *cast(vec2*)&packet.origin);
+        maskShader.setUniform(maskMvpUniform, *cast(mat4*)&packet.mvp);
+
+        if (packet.vertexCount == 0 || packet.vertexAtlasStride == 0 || packet.deformAtlasStride == 0) return;
+        auto sharedVbo = sharedVertexBufferHandle();
+        auto sharedDbo = sharedDeformBufferHandle();
+        if (sharedVbo == 0 || sharedDbo == 0) return;
+        auto vertexOffsetBytes = cast(ptrdiff_t)packet.vertexOffset * float.sizeof;
+        auto vertexStrideBytes = cast(ptrdiff_t)packet.vertexAtlasStride * float.sizeof;
+        auto vertexLane1Offset = vertexStrideBytes + vertexOffsetBytes;
+        auto deformOffsetBytes = cast(ptrdiff_t)packet.deformOffset * float.sizeof;
+        auto deformStrideBytes = cast(ptrdiff_t)packet.deformAtlasStride * float.sizeof;
+        auto deformLane1Offset = deformStrideBytes + deformOffsetBytes;
+
+        glEnableVertexAttribArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, sharedVbo);
+        glVertexAttribPointer(0, 1, GL_FLOAT, GL_FALSE, 0, cast(void*)vertexOffsetBytes);
+
+        glEnableVertexAttribArray(1);
+        glBindBuffer(GL_ARRAY_BUFFER, sharedVbo);
+        glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, 0, cast(void*)vertexLane1Offset);
+
+        glEnableVertexAttribArray(2);
+        glBindBuffer(GL_ARRAY_BUFFER, sharedDbo);
+        glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 0, cast(void*)deformOffsetBytes);
+
+        glEnableVertexAttribArray(3);
+        glBindBuffer(GL_ARRAY_BUFFER, sharedDbo);
+        glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 0, cast(void*)deformLane1Offset);
+
+        auto ibo = getOrCreateIbo(packet.indices, packet.indexCount);
+        drawDrawableElements(ibo, packet.indexCount);
+        glDisableVertexAttribArray(0);
+        glDisableVertexAttribArray(1);
+        glDisableVertexAttribArray(2);
+        glDisableVertexAttribArray(3);
+    }
+
     void setupShaderStage(ref PartDrawPacket packet, int stage, mat4 matrix, mat4 renderMatrix) {
         mat4 mvpMatrix = renderMatrix * matrix;
 
@@ -1755,6 +1881,74 @@ private:
                 partShader.setUniform(gMultColor, packet.clampedTint);
                 partShader.setUniform(gScreenColor, packet.clampedScreen);
                 applyBlendMode(packet.blendingMode, true);
+                break;
+            default:
+                return;
+        }
+    }
+
+    void setupShaderStage(ref const(NjgPartDrawPacket) packet, int stage, mat4 matrix, mat4 renderMatrix) {
+        mat4 mvpMatrix = renderMatrix * matrix;
+
+        auto setDrawBuffersSafe = (int desired) {
+            GLenum[3] bufs;
+            int count = 0;
+            auto addIfPresent = (GLenum att) {
+                GLint type = GL_NONE;
+                glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER, att,
+                    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+                if (type != GL_NONE) {
+                    bufs[count++] = att;
+                }
+            };
+            addIfPresent(GL_COLOR_ATTACHMENT0);
+            if (desired > 1) addIfPresent(GL_COLOR_ATTACHMENT1);
+            if (desired > 2) addIfPresent(GL_COLOR_ATTACHMENT2);
+            if (count == 0) {
+                glDrawBuffer(GL_BACK);
+            } else {
+                glDrawBuffers(count, bufs.ptr);
+            }
+            return count;
+        };
+
+        auto origin = *cast(vec2*)&packet.origin;
+        auto clampedTint = *cast(vec3*)&packet.clampedTint;
+        auto clampedScreen = *cast(vec3*)&packet.clampedScreen;
+        auto blendMode = cast(BlendMode)packet.blendingMode;
+
+        switch (stage) {
+            case 0:
+                setDrawBuffersSafe(1);
+                partShaderStage1.use();
+                partShaderStage1.setUniform(gs1offset, origin);
+                partShaderStage1.setUniform(gs1mvp, mvpMatrix);
+                partShaderStage1.setUniform(gs1opacity, packet.opacity);
+                partShaderStage1.setUniform(gs1MultColor, clampedTint);
+                partShaderStage1.setUniform(gs1ScreenColor, clampedScreen);
+                applyBlendMode(blendMode, false);
+                break;
+            case 1:
+                setDrawBuffersSafe(2);
+                partShaderStage2.use();
+                partShaderStage2.setUniform(gs2offset, origin);
+                partShaderStage2.setUniform(gs2mvp, mvpMatrix);
+                partShaderStage2.setUniform(gs2opacity, packet.opacity);
+                partShaderStage2.setUniform(gs2EmissionStrength, packet.emissionStrength);
+                partShaderStage2.setUniform(gs2MultColor, clampedTint);
+                partShaderStage2.setUniform(gs2ScreenColor, clampedScreen);
+                applyBlendMode(blendMode, true);
+                break;
+            case 2:
+                setDrawBuffersSafe(3);
+                partShader.use();
+                partShader.setUniform(offset, origin);
+                partShader.setUniform(mvp, mvpMatrix);
+                partShader.setUniform(gopacity, packet.opacity);
+                partShader.setUniform(gEmissionStrength, packet.emissionStrength);
+                partShader.setUniform(gMultColor, clampedTint);
+                partShader.setUniform(gScreenColor, clampedScreen);
+                applyBlendMode(blendMode, true);
                 break;
             default:
                 return;
@@ -1821,9 +2015,96 @@ private:
         }
     }
 
+    void renderStage(ref const(NjgPartDrawPacket) packet, bool advanced) {
+        auto ibo = getOrCreateIbo(packet.indices, packet.indexCount);
+        auto indexCount = cast(uint)packet.indexCount;
+
+        if (!ibo || indexCount == 0 || packet.vertexCount == 0) return;
+        if (packet.vertexAtlasStride == 0 || packet.uvAtlasStride == 0 || packet.deformAtlasStride == 0) return;
+
+        auto vertexBuffer = sharedVertexBufferHandle();
+        auto uvBuffer = sharedUvBufferHandle();
+        auto deformBuffer = sharedDeformBufferHandle();
+        if (vertexBuffer == 0 || uvBuffer == 0 || deformBuffer == 0) return;
+
+        auto vertexOffsetBytes = cast(ptrdiff_t)packet.vertexOffset * float.sizeof;
+        auto uvOffsetBytes = cast(ptrdiff_t)packet.uvOffset * float.sizeof;
+        auto deformOffsetBytes = cast(ptrdiff_t)packet.deformOffset * float.sizeof;
+
+        auto vertexStrideBytes = cast(ptrdiff_t)packet.vertexAtlasStride * float.sizeof;
+        auto uvStrideBytes = cast(ptrdiff_t)packet.uvAtlasStride * float.sizeof;
+        auto deformStrideBytes = cast(ptrdiff_t)packet.deformAtlasStride * float.sizeof;
+
+        auto vertexLane1Offset = vertexStrideBytes + vertexOffsetBytes;
+        auto uvLane1Offset = uvStrideBytes + uvOffsetBytes;
+        auto deformLane1Offset = deformStrideBytes + deformOffsetBytes;
+        glEnableVertexAttribArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
+        glVertexAttribPointer(0, 1, GL_FLOAT, GL_FALSE, 0, cast(void*)vertexOffsetBytes);
+
+        glEnableVertexAttribArray(1);
+        glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
+        glVertexAttribPointer(1, 1, GL_FLOAT, GL_FALSE, 0, cast(void*)vertexLane1Offset);
+
+        glEnableVertexAttribArray(2);
+        glBindBuffer(GL_ARRAY_BUFFER, uvBuffer);
+        glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, 0, cast(void*)uvOffsetBytes);
+
+        glEnableVertexAttribArray(3);
+        glBindBuffer(GL_ARRAY_BUFFER, uvBuffer);
+        glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 0, cast(void*)uvLane1Offset);
+
+        glEnableVertexAttribArray(4);
+        glBindBuffer(GL_ARRAY_BUFFER, deformBuffer);
+        glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, 0, cast(void*)deformOffsetBytes);
+
+        glEnableVertexAttribArray(5);
+        glBindBuffer(GL_ARRAY_BUFFER, deformBuffer);
+        glVertexAttribPointer(5, 1, GL_FLOAT, GL_FALSE, 0, cast(void*)deformLane1Offset);
+
+        drawDrawableElements(ibo, indexCount);
+        glDisableVertexAttribArray(0);
+        glDisableVertexAttribArray(1);
+        glDisableVertexAttribArray(2);
+        glDisableVertexAttribArray(3);
+        glDisableVertexAttribArray(4);
+        glDisableVertexAttribArray(5);
+
+        if (advanced) {
+            blendModeBarrier(cast(BlendMode)packet.blendingMode);
+        }
+    }
+
     size_t textureNativeHandle(GLTextureHandle texture) {
         auto handle = texture;
         return handle.id;
+    }
+
+    DynamicCompositePass createDynamicCompositePass(ref const(NjgDynamicCompositePass) packet, Texture[size_t] texturesByHandle) {
+        auto pass = new DynamicCompositePass;
+        auto surface = new DynamicCompositeSurface;
+        surface.textureCount = min(packet.textureCount, packet.textures.length);
+        foreach (i; 0 .. surface.textureCount) {
+            if (auto tex = packet.textures[i] in texturesByHandle) {
+                surface.textures[i] = *tex;
+            } else {
+                surface.textures[i] = null;
+            }
+        }
+        if (auto stencil = packet.stencil in texturesByHandle) {
+            surface.stencil = *stencil;
+        } else {
+            surface.stencil = null;
+        }
+        pass.surface = surface;
+        pass.scale = *cast(vec2*)&packet.scale;
+        pass.rotationZ = packet.rotationZ;
+        pass.origBuffer = packet.origBuffer;
+        pass.origViewport[] = packet.origViewport;
+        pass.autoScaled = packet.autoScaled;
+        pass.drawBufferCount = packet.drawBufferCount;
+        pass.hasStencil = packet.hasStencil;
+        return pass;
     }
 }
 
@@ -1959,8 +2240,6 @@ struct OpenGLBackendInit {
     UnityResourceCallbacks callbacks;
 }
 
-alias NlMaskKind = MaskDrawableKind;
-
 __gshared Texture[size_t] gTextures; // Unity handle -> nlshim Texture
 __gshared size_t gNextHandle = 1;
 __gshared bool gBackendInitialized;
@@ -2049,7 +2328,7 @@ OpenGLBackendInit initOpenGLBackend(int width, int height, bool isTest) {
             slice = new ubyte[need];
             slice[0 .. dataLen] = data[0 .. dataLen];
         }
-        (*tex).setData(slice.dup, channels);
+        (*tex).setData(slice, channels);
     };
     cbs.releaseTexture = (size_t handle, void* userData) {
         if (auto tex = handle in gTextures) {
@@ -2062,13 +2341,6 @@ OpenGLBackendInit initOpenGLBackend(int width, int height, bool isTest) {
 }
 
 // ==== Rendering pipeline ====
-/// Lookup Texture created via callbacks.
-Texture toTex(size_t h) {
-    auto tex = h in gTextures;
-    return tex is null ? null : *tex;
-}
-
-// Bridge: convert DLL packets to backend PartDrawPacket/MaskDrawPacket and call ogl*.
 void renderCommands(const OpenGLBackendInit* gl,
                     const SharedBufferSnapshot* snapshot,
                     const CommandQueueView* view)
@@ -2106,31 +2378,7 @@ void renderCommands(const OpenGLBackendInit* gl,
         switch (cmd.kind) {
             case NjgRenderCommandKind.DrawPart: {
                 drawCount++;
-                PartDrawPacket p;
-                p.renderable = true;
-                p.isMask = cmd.partPacket.isMask;
-                p.modelMatrix = *cast(mat4*)&cmd.partPacket.modelMatrix;
-                p.renderMatrix = *cast(mat4*)&cmd.partPacket.renderMatrix;
-                p.origin = *cast(vec2*)&cmd.partPacket.origin;
-                p.vertexOffset = cmd.partPacket.vertexOffset;
-                p.vertexAtlasStride = cmd.partPacket.vertexAtlasStride;
-                p.uvOffset = cmd.partPacket.uvOffset;
-                p.uvAtlasStride = cmd.partPacket.uvAtlasStride;
-                p.deformOffset = cmd.partPacket.deformOffset;
-                p.deformAtlasStride = cmd.partPacket.deformAtlasStride;
-                p.indexCount = cast(uint)cmd.partPacket.indexCount;
-                p.vertexCount = cast(uint)cmd.partPacket.vertexCount;
-                p.textures.length = cmd.partPacket.textureCount;
-                foreach(i; 0 .. cmd.partPacket.textureCount) p.textures[i] = toTex(cmd.partPacket.textureHandles[i]);
-                p.opacity = cmd.partPacket.opacity;
-                p.clampedTint = *cast(vec3*)&cmd.partPacket.clampedTint;
-                p.clampedScreen = *cast(vec3*)&cmd.partPacket.clampedScreen;
-                p.maskThreshold = cmd.partPacket.maskThreshold;
-                p.blendingMode = cast(BlendMode)cmd.partPacket.blendingMode;
-                p.useMultistageBlend = cmd.partPacket.useMultistageBlend;
-                p.hasEmissionOrBumpmap = cmd.partPacket.hasEmissionOrBumpmap;
-                p.indexBuffer = backend.getOrCreateIbo(cmd.partPacket.indices, cmd.partPacket.indexCount);
-                backend.drawPartPacket(p);
+                backend.drawPartPacket(cmd.partPacket, gTextures);
                 break;
             }
             case NjgRenderCommandKind.DrawMask: {
@@ -2142,51 +2390,7 @@ void renderCommands(const OpenGLBackendInit* gl,
                 break;
             }
             case NjgRenderCommandKind.ApplyMask: {
-                MaskApplyPacket mp;
-                PartDrawPacket p;
-                auto src = cmd.maskApplyPacket.partPacket;
-                p.renderable = true;
-                p.isMask = src.isMask;
-                p.modelMatrix = *cast(mat4*)&src.modelMatrix;
-                p.renderMatrix = *cast(mat4*)&src.renderMatrix;
-                p.origin = *cast(vec2*)&src.origin;
-                p.vertexOffset = src.vertexOffset;
-                p.vertexAtlasStride = src.vertexAtlasStride;
-                p.uvOffset = src.uvOffset;
-                p.uvAtlasStride = src.uvAtlasStride;
-                p.deformOffset = src.deformOffset;
-                p.deformAtlasStride = src.deformAtlasStride;
-                p.indexCount = cast(uint)src.indexCount;
-                p.vertexCount = cast(uint)src.vertexCount;
-                p.textures.length = src.textureCount;
-                foreach(i; 0 .. src.textureCount) p.textures[i] = toTex(src.textureHandles[i]);
-                p.opacity = src.opacity;
-                p.clampedTint = *cast(vec3*)&src.clampedTint;
-                p.clampedScreen = *cast(vec3*)&src.clampedScreen;
-                p.maskThreshold = src.maskThreshold;
-                p.blendingMode = cast(BlendMode)src.blendingMode;
-                p.useMultistageBlend = src.useMultistageBlend;
-                p.hasEmissionOrBumpmap = src.hasEmissionOrBumpmap;
-                p.indexBuffer = backend.getOrCreateIbo(src.indices, src.indexCount);
-                mp.partPacket = p;
-
-                MaskDrawPacket m;
-                auto ms = cmd.maskApplyPacket.maskPacket;
-                m.modelMatrix = *cast(mat4*)&ms.modelMatrix;
-                m.mvp = *cast(mat4*)&ms.mvp;
-                m.origin = *cast(vec2*)&ms.origin;
-                m.vertexOffset = ms.vertexOffset;
-                m.vertexAtlasStride = ms.vertexAtlasStride;
-                m.deformOffset = ms.deformOffset;
-                m.deformAtlasStride = ms.deformAtlasStride;
-                m.indexCount = cast(uint)ms.indexCount;
-                m.vertexCount = cast(uint)ms.vertexCount;
-                m.indexBuffer = backend.getOrCreateIbo(ms.indices, ms.indexCount);
-
-                mp.maskPacket = m;
-                mp.kind = cast(NlMaskKind)cmd.maskApplyPacket.kind;
-                mp.isDodge = cmd.maskApplyPacket.isDodge;
-                backend.applyMask(mp);
+                backend.applyMask(cmd.maskApplyPacket, gTextures);
                 break;
             }
             case NjgRenderCommandKind.BeginMaskContent:
@@ -2197,21 +2401,7 @@ void renderCommands(const OpenGLBackendInit* gl,
                 break;
             case NjgRenderCommandKind.BeginDynamicComposite: {
                 dynDrawStack ~= cast(int)drawCount;
-                auto pass = new DynamicCompositePass;
-                auto surf = new DynamicCompositeSurface;
-                surf.textureCount = cmd.dynamicPass.textureCount;
-                foreach(i; 0 .. surf.textureCount) {
-                    surf.textures[i] = toTex(cmd.dynamicPass.textures[i]);
-                }
-                surf.stencil = toTex(cmd.dynamicPass.stencil);
-                pass.surface = surf;
-                pass.scale = *cast(vec2*)&cmd.dynamicPass.scale;
-                pass.rotationZ = cmd.dynamicPass.rotationZ;
-                pass.origBuffer = cmd.dynamicPass.origBuffer;
-                pass.origViewport[] = cmd.dynamicPass.origViewport;
-                pass.autoScaled = cmd.dynamicPass.autoScaled;
-                pass.drawBufferCount = cmd.dynamicPass.drawBufferCount;
-                pass.hasStencil = cmd.dynamicPass.hasStencil;
+                auto pass = backend.createDynamicCompositePass(cmd.dynamicPass, gTextures);
                 dynPassStack ~= pass;
                 backend.beginDynamicComposite(pass);
                 break;
@@ -2222,22 +2412,7 @@ void renderCommands(const OpenGLBackendInit* gl,
                     pass = dynPassStack[$-1];
                     dynPassStack.length = dynPassStack.length - 1;
                 } else {
-                    // Fallback: reconstruct (should not happen)
-                    pass = new DynamicCompositePass;
-                    auto surf = new DynamicCompositeSurface;
-                    surf.textureCount = cmd.dynamicPass.textureCount;
-                    foreach(i; 0 .. surf.textureCount) {
-                        surf.textures[i] = toTex(cmd.dynamicPass.textures[i]);
-                    }
-                    surf.stencil = toTex(cmd.dynamicPass.stencil);
-                    pass.surface = surf;
-                    pass.scale = *cast(vec2*)&cmd.dynamicPass.scale;
-                    pass.rotationZ = cmd.dynamicPass.rotationZ;
-                    pass.origBuffer = cmd.dynamicPass.origBuffer;
-                    pass.origViewport[] = cmd.dynamicPass.origViewport;
-                    pass.autoScaled = cmd.dynamicPass.autoScaled;
-                    pass.drawBufferCount = cmd.dynamicPass.drawBufferCount;
-                    pass.hasStencil = cmd.dynamicPass.hasStencil;
+                    pass = backend.createDynamicCompositePass(cmd.dynamicPass, gTextures);
                 }
                 backend.endDynamicComposite(pass);
                 if (dynDrawStack.length) {
