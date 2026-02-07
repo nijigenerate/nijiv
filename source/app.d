@@ -7,35 +7,41 @@ import std.exception : enforce;
 import std.file : exists, getcwd;
 import std.path : buildPath, dirName;
 import std.stdio : writeln, writefln;
-import std.string : fromStringz, toStringz;
+import std.string : fromStringz, toStringz, endsWith;
 import std.math : exp;
 import std.algorithm : clamp;
 
-import bindbc.opengl;
 import bindbc.sdl;
 
-import ogl = opengl.opengl_backend;
-import opengl.opengl_backend : NjgResult, UnityRendererConfig, UnityResourceCallbacks, RendererHandle, PuppetHandle, FrameConfig, CommandQueueView, SharedBufferSnapshot;
-import opengl.opengl_backend : initOpenGLBackend, OpenGLBackendInit;
-import opengl.opengl_backend : currentRenderBackend;
+version (EnableVulkanBackend) {
+    import gfx = vulkan_backend;
+    enum backendName = "vulkan";
+    alias BackendInit = gfx.VulkanBackendInit;
+} else {
+    import bindbc.opengl;
+    import gfx = opengl.opengl_backend;
+    import opengl.opengl_backend : currentRenderBackend;
+    enum backendName = "opengl";
+    alias BackendInit = gfx.OpenGLBackendInit;
+}
 import core.runtime : Runtime;
 enum MaskDrawableKind : uint { Part, Mask }
 
 extern(C) alias NjgLogFn = void function(const(char)* message, size_t length, void* userData);
 
-alias FnCreateRenderer = extern(C) NjgResult function(const UnityRendererConfig*, const UnityResourceCallbacks*, RendererHandle*);
-alias FnDestroyRenderer = extern(C) void function(RendererHandle);
-alias FnLoadPuppet = extern(C) NjgResult function(RendererHandle, const char*, PuppetHandle*);
-alias FnUnloadPuppet = extern(C) NjgResult function(RendererHandle, PuppetHandle);
-alias FnBeginFrame = extern(C) NjgResult function(RendererHandle, const FrameConfig*);
-alias FnTickPuppet = extern(C) NjgResult function(PuppetHandle, double);
-alias FnEmitCommands = extern(C) NjgResult function(RendererHandle, CommandQueueView*);
-alias FnFlushCommandBuffer = extern(C) void function(RendererHandle);
+alias FnCreateRenderer = extern(C) gfx.NjgResult function(const gfx.UnityRendererConfig*, const gfx.UnityResourceCallbacks*, gfx.RendererHandle*);
+alias FnDestroyRenderer = extern(C) void function(gfx.RendererHandle);
+alias FnLoadPuppet = extern(C) gfx.NjgResult function(gfx.RendererHandle, const char*, gfx.PuppetHandle*);
+alias FnUnloadPuppet = extern(C) gfx.NjgResult function(gfx.RendererHandle, gfx.PuppetHandle);
+alias FnBeginFrame = extern(C) gfx.NjgResult function(gfx.RendererHandle, const gfx.FrameConfig*);
+alias FnTickPuppet = extern(C) gfx.NjgResult function(gfx.PuppetHandle, double);
+alias FnEmitCommands = extern(C) gfx.NjgResult function(gfx.RendererHandle, gfx.CommandQueueView*);
+alias FnFlushCommandBuffer = extern(C) void function(gfx.RendererHandle);
 alias FnSetLogCallback = extern(C) void function(NjgLogFn, void*);
 alias FnRtInit = extern(C) void function();
 alias FnRtTerm = extern(C) void function();
-alias FnGetSharedBuffers = extern(C) NjgResult function(RendererHandle, SharedBufferSnapshot*);
-alias FnSetPuppetScale = extern(C) NjgResult function(PuppetHandle, float, float);
+alias FnGetSharedBuffers = extern(C) gfx.NjgResult function(gfx.RendererHandle, gfx.SharedBufferSnapshot*);
+alias FnSetPuppetScale = extern(C) gfx.NjgResult function(gfx.PuppetHandle, float, float);
 
 struct UnityApi {
     void* lib;
@@ -105,6 +111,32 @@ string[] unityLibraryNames() {
     }
 }
 
+string resolvePuppetPath(string rawPath) {
+    if (exists(rawPath)) return rawPath;
+
+    string[] candidates;
+    // Common typo: .inxd (directory-like typo) for .inx
+    if (rawPath.endsWith(".inxd")) {
+        candidates ~= rawPath[0 .. $ - 1]; // -> .inx
+    }
+    // Also try sibling package formats with same stem.
+    if (rawPath.endsWith(".inx") || rawPath.endsWith(".inxd") || rawPath.endsWith(".inp")) {
+        auto dot = rawPath.length - 1;
+        while (dot > 0 && rawPath[dot] != '.') dot--;
+        if (dot > 0) {
+            auto stem = rawPath[0 .. dot];
+            candidates ~= stem ~ ".inx";
+            candidates ~= stem ~ ".inp";
+        }
+    }
+
+    foreach (c; candidates) {
+        if (exists(c)) return c;
+    }
+    enforce(false, "Puppet file not found: " ~ rawPath ~ " (tried: " ~ candidates.to!string ~ ")");
+    return rawPath;
+}
+
 void main(string[] args) {
     bool isTest = false;
     string[] positional;
@@ -139,7 +171,7 @@ void main(string[] args) {
         writeln("Usage: nijiv <puppet.inp|puppet.inx> [width height] [--test]");
         return;
     }
-    string puppetPath = positional[0];
+    string puppetPath = resolvePuppetPath(positional[0]);
     import std.algorithm : all;
     import std.ascii : isDigit;
     bool hasWidth = positional.length > 1 && positional[1].all!isDigit;
@@ -156,16 +188,27 @@ void main(string[] args) {
         try testTimeout = msecs(to!int(fromStringz(p))); catch (Exception) {}
     }
 
-    writefln("nijiv (Unity DLL) start: file=%s, size=%sx%s (test=%s frames=%s timeout=%s)", puppetPath, width, height, isTest, testMaxFrames, testTimeout);
+    writefln("nijiv (%s DLL) start: file=%s, size=%sx%s (test=%s frames=%s timeout=%s)",
+        backendName, puppetPath, width, height, isTest, testMaxFrames, testTimeout);
 
-    auto glInit = initOpenGLBackend(width, height, isTest);
-    scope (exit) {
-        if (glInit.glContext !is null) SDL_GL_DeleteContext(glInit.glContext);
-        if (glInit.window !is null) SDL_DestroyWindow(glInit.window);
-        SDL_Quit();
+    BackendInit backendInit = void;
+    version (EnableVulkanBackend) {
+        backendInit = gfx.initVulkanBackend(width, height, isTest);
+        scope (exit) {
+            if (backendInit.backend !is null) backendInit.backend.dispose();
+            if (backendInit.window !is null) SDL_DestroyWindow(backendInit.window);
+            SDL_Quit();
+        }
+        SDL_Vulkan_GetDrawableSize(backendInit.window, &backendInit.drawableW, &backendInit.drawableH);
+    } else {
+        backendInit = gfx.initOpenGLBackend(width, height, isTest);
+        scope (exit) {
+            if (backendInit.glContext !is null) SDL_GL_DeleteContext(backendInit.glContext);
+            if (backendInit.window !is null) SDL_DestroyWindow(backendInit.window);
+            SDL_Quit();
+        }
+        SDL_GL_GetDrawableSize(backendInit.window, &backendInit.drawableW, &backendInit.drawableH);
     }
-    // Ensure drawable size reflects the actual GL framebuffer (handles HiDPI).
-    SDL_GL_GetDrawableSize(glInit.window, &glInit.drawableW, &glInit.drawableH);
 
     // Load the Unity-facing DLL from a nearby nijilive build.
     string exeDir = getcwd();
@@ -191,25 +234,31 @@ void main(string[] args) {
     scope (exit) if (api.rtTerm !is null) api.rtTerm();
     api.setLogCallback(&logCallback, null);
 
-    UnityRendererConfig rendererCfg;
-    rendererCfg.viewportWidth = glInit.drawableW;
-    rendererCfg.viewportHeight = glInit.drawableH;
-    RendererHandle renderer;
-    enforce(api.createRenderer(&rendererCfg, &glInit.callbacks, &renderer) == NjgResult.Ok,
-        "njgCreateRenderer failed");
+    gfx.UnityRendererConfig rendererCfg;
+    rendererCfg.viewportWidth = backendInit.drawableW;
+    rendererCfg.viewportHeight = backendInit.drawableH;
+    gfx.RendererHandle renderer;
+    auto createRendererRes = api.createRenderer(&rendererCfg, &backendInit.callbacks, &renderer);
+    enforce(createRendererRes == gfx.NjgResult.Ok,
+        "njgCreateRenderer failed: " ~ createRendererRes.to!string);
 
-    PuppetHandle puppet;
-    enforce(api.loadPuppet(renderer, puppetPath.toStringz, &puppet) == NjgResult.Ok,
-        "njgLoadPuppet failed");
-    FrameConfig frameCfg;
-    frameCfg.viewportWidth = glInit.drawableW;
-    frameCfg.viewportHeight = glInit.drawableH;
-    currentRenderBackend().setViewport(glInit.drawableW, glInit.drawableH);
+    gfx.PuppetHandle puppet;
+    auto loadPuppetRes = api.loadPuppet(renderer, puppetPath.toStringz, &puppet);
+    enforce(loadPuppetRes == gfx.NjgResult.Ok,
+        "njgLoadPuppet failed: " ~ loadPuppetRes.to!string ~ " path=" ~ puppetPath);
+    gfx.FrameConfig frameCfg;
+    frameCfg.viewportWidth = backendInit.drawableW;
+    frameCfg.viewportHeight = backendInit.drawableH;
+    version (EnableVulkanBackend) {
+        backendInit.backend.setViewport(backendInit.drawableW, backendInit.drawableH);
+    } else {
+        currentRenderBackend().setViewport(backendInit.drawableW, backendInit.drawableH);
+    }
     float puppetScale = 0.12f;
 
     // Apply initial scale (default 0.25) so that the view starts zoomed out.
     auto initScaleRes = api.setPuppetScale(puppet, puppetScale, puppetScale);
-    if (initScaleRes != NjgResult.Ok) {
+    if (initScaleRes != gfx.NjgResult.Ok) {
         writeln("njgSetPuppetScale initial apply failed: ", initScaleRes);
     }
 
@@ -231,10 +280,17 @@ void main(string[] args) {
                 case SDL_WINDOWEVENT:
                     if (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
                         ev.window.event == SDL_WINDOWEVENT_RESIZED) {
-                        SDL_GL_GetDrawableSize(glInit.window, &glInit.drawableW, &glInit.drawableH);
-                        frameCfg.viewportWidth = glInit.drawableW;
-                        frameCfg.viewportHeight = glInit.drawableH;
-                        currentRenderBackend().setViewport(glInit.drawableW, glInit.drawableH);
+                        version (EnableVulkanBackend) {
+                            SDL_Vulkan_GetDrawableSize(backendInit.window, &backendInit.drawableW, &backendInit.drawableH);
+                            frameCfg.viewportWidth = backendInit.drawableW;
+                            frameCfg.viewportHeight = backendInit.drawableH;
+                            backendInit.backend.setViewport(backendInit.drawableW, backendInit.drawableH);
+                        } else {
+                            SDL_GL_GetDrawableSize(backendInit.window, &backendInit.drawableW, &backendInit.drawableH);
+                            frameCfg.viewportWidth = backendInit.drawableW;
+                            frameCfg.viewportHeight = backendInit.drawableH;
+                            currentRenderBackend().setViewport(backendInit.drawableW, backendInit.drawableH);
+                        }
                     }
                     break;
                 case SDL_MOUSEWHEEL:
@@ -244,7 +300,7 @@ void main(string[] args) {
                         float factor = cast(float)exp(step * -ev.wheel.y);
                         puppetScale = clamp(puppetScale * factor, 0.1f, 10.0f);
                         auto res = api.setPuppetScale(puppet, puppetScale, puppetScale);
-                        if (res != NjgResult.Ok) {
+                        if (res != gfx.NjgResult.Ok) {
                             writeln("njgSetPuppetScale failed: ", res);
                         }
                     }
@@ -259,22 +315,25 @@ void main(string[] args) {
         prev = now;
         double deltaSec = delta.total!"nsecs" / 1_000_000_000.0;
 
-        enforce(api.beginFrame(renderer, &frameCfg) == NjgResult.Ok, "njgBeginFrame failed");
-        enforce(api.tickPuppet(puppet, deltaSec) == NjgResult.Ok, "njgTickPuppet failed");
+        enforce(api.beginFrame(renderer, &frameCfg) == gfx.NjgResult.Ok, "njgBeginFrame failed");
+        enforce(api.tickPuppet(puppet, deltaSec) == gfx.NjgResult.Ok, "njgTickPuppet failed");
 
-        CommandQueueView view;
-        enforce(api.emitCommands(renderer, &view) == NjgResult.Ok, "njgEmitCommands failed");
+        gfx.CommandQueueView view;
+        enforce(api.emitCommands(renderer, &view) == gfx.NjgResult.Ok, "njgEmitCommands failed");
         if (view.count && frameCount % 60 == 0) {
             writefln("Frame %s: queued commands=%s", frameCount, view.count);
         }
 
-        SharedBufferSnapshot snapshot;
-        enforce(api.getSharedBuffers(renderer, &snapshot) == NjgResult.Ok, "njgGetSharedBuffers failed");
+        gfx.SharedBufferSnapshot snapshot;
+        enforce(api.getSharedBuffers(renderer, &snapshot) == gfx.NjgResult.Ok, "njgGetSharedBuffers failed");
 
-        ogl.renderCommands(&glInit, &snapshot, &view);
+        gfx.renderCommands(&backendInit, &snapshot, &view);
 
         api.flushCommands(renderer);
-        SDL_GL_SwapWindow(glInit.window);
+        version (EnableVulkanBackend) {
+        } else {
+            SDL_GL_SwapWindow(backendInit.window);
+        }
 
         frameCount++;
         if (isTest && frameCount >= testMaxFrames) {

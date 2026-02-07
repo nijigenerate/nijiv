@@ -7,14 +7,22 @@ dflags "-link-defaultlib-shared=true" "-fno-moduleinfo"
 
 dependency "bindbc-sdl" version="~>1.1.3"
 dependency "bindbc-opengl" version="*"
+dependency "erupted" version="*"
 dependency "fghj" version="~>1.0.2"
 dependency "inmath" version="1.0.6"
 dependency "imagefmt" version="~>2.1.0"
-stringImportPaths "source/shaders/"
 stringImportPaths "source"
-versions "InDoesRender"
 
 versions "SDL_206" "GL_32"
 
 importPaths "source"
 excludedSourceFiles "source/nlshim/core/render/graph_builder.d source/nlshim/core/render/scheduler.d source/nlshim/core/render/command_emitter.d source/nlshim/core/render/backends/queue/** source/nlshim/core/render/backends/opengl/queue.d source/nlshim/core/render/backends/opengl/diff_collect_impl.d source/nlshim/core/render/backends/opengl/draw_texture.d source/nlshim/core/render/backends/directx12/** source/nlshim/core/render/immediate.d"
+
+configuration "opengl" {
+    targetName "nijiv-opengl"
+}
+
+configuration "vulkan" {
+    targetName "nijiv-vulkan"
+    versions "EnableVulkanBackend"
+}
