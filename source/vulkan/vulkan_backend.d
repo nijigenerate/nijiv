@@ -1066,22 +1066,8 @@ private:
         }
         swapchainFormat = chosen.format;
 
-        uint32_t presentModeCount = 0;
-        vkEnforce(vkGetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, surface, &presentModeCount, null),
-            "vkGetPhysicalDeviceSurfacePresentModesKHR count failed");
+        // Keep behavior aligned with OpenGL backend: always present on vblank.
         VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
-        if (!isTest && presentModeCount > 0) {
-            VkPresentModeKHR[] modes;
-            modes.length = presentModeCount;
-            vkEnforce(vkGetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, surface, &presentModeCount, modes.ptr),
-                "vkGetPhysicalDeviceSurfacePresentModesKHR failed");
-            foreach (m; modes) {
-                if (m == VK_PRESENT_MODE_MAILBOX_KHR) {
-                    presentMode = m;
-                    break;
-                }
-            }
-        }
 
         if (caps.currentExtent.width != uint.max) {
             swapchainExtent = caps.currentExtent;
