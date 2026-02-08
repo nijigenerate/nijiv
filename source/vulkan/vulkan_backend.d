@@ -2690,11 +2690,17 @@ private:
                                              imageAvailable[frameIndex],
                                              VK_NULL_HANDLE,
                                              &imageIndex);
+        bool swapchainNeedsRecreate = false;
         if (acquire == VK_ERROR_OUT_OF_DATE_KHR) {
             recreateSwapchain();
             return;
         }
-        vkEnforce(acquire, "vkAcquireNextImageKHR failed");
+        if (acquire == VK_SUBOPTIMAL_KHR) {
+            // Image acquisition succeeded; continue this frame and recreate right after present.
+            swapchainNeedsRecreate = true;
+        } else {
+            vkEnforce(acquire, "vkAcquireNextImageKHR failed");
+        }
 
         if (imageIndex < inFlightByImage.length && inFlightByImage[imageIndex] != VK_NULL_HANDLE) {
             vkWaitForFences(device, 1, &inFlightByImage[imageIndex], VK_TRUE, ulong.max);
@@ -2738,7 +2744,9 @@ private:
         present.pImageIndices = &imageIndex;
 
         auto presentRes = vkQueuePresentKHR(presentQueue, &present);
-        if (presentRes == VK_ERROR_OUT_OF_DATE_KHR || presentRes == VK_SUBOPTIMAL_KHR) {
+        if (swapchainNeedsRecreate ||
+            presentRes == VK_ERROR_OUT_OF_DATE_KHR ||
+            presentRes == VK_SUBOPTIMAL_KHR) {
             recreateSwapchain();
         } else {
             vkEnforce(presentRes, "vkQueuePresentKHR failed");

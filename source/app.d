@@ -381,6 +381,9 @@ void main(string[] args) {
                     break;
             }
         }
+        if (!running) {
+            break;
+        }
 
         MonoTime now = MonoTime.currTime;
         Duration delta = now - prev;
