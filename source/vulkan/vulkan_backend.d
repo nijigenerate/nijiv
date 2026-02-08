@@ -9,10 +9,13 @@ import std.conv : to;
 import std.exception : enforce;
 import std.math : isNaN;
 import std.process : environment;
+import std.stdio : writeln;
 import std.string : fromStringz, toStringz;
+import core.thread : thread_attachThis;
 
 import core.stdc.string : memcpy;
 import core.stdc.stdint : uint32_t;
+import core.stdc.stdio : fprintf, stderr;
 
 import bindbc.sdl;
 import bindbc.sdl.bind.sdlvulkan;
@@ -294,6 +297,18 @@ public:
 
 private __gshared Texture[size_t] gTextures;
 private __gshared size_t gNextHandle = 1;
+private __gshared Object gTexturesGuard;
+
+shared static this() {
+    gTexturesGuard = new Object();
+}
+
+private void ensureDThreadAttached() {
+    if (gTexturesGuard is null) {
+        gTexturesGuard = new Object();
+    }
+    thread_attachThis();
+}
 
 private string sdlError() {
     auto err = SDL_GetError();
@@ -302,6 +317,26 @@ private string sdlError() {
 
 private void vkEnforce(VkResult result, string message) {
     enforce(result == VK_SUCCESS, message ~ " (VkResult=" ~ result.to!string ~ ")");
+}
+
+private bool envEnabled(string name) {
+    auto value = environment.get(name, "");
+    return value == "1" || value == "true" || value == "TRUE";
+}
+
+private extern(System) nothrow @nogc VkBool32 vulkanValidationCallback(
+    VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+    VkDebugUtilsMessageTypeFlagsEXT types,
+    const(VkDebugUtilsMessengerCallbackDataEXT)* callbackData,
+    void* userData) {
+    if (callbackData !is null && callbackData.pMessage !is null) {
+        fprintf(stderr,
+                "[vulkan][validation] sev=%u type=%u %s\n",
+                cast(uint)severity,
+                cast(uint)types,
+                callbackData.pMessage);
+    }
+    return VK_FALSE;
 }
 
 private float[16] mulMat4(ref const(float[16]) a, ref const(float[16]) b) {
@@ -385,6 +420,8 @@ private:
     bool isTest;
 
     VkInstance instance;
+    bool validationEnabled;
+    VkDebugUtilsMessengerEXT debugMessenger;
     VkSurfaceKHR surface;
     VkPhysicalDevice physicalDevice;
     VkDevice device;
@@ -402,12 +439,14 @@ private:
     VkImage[] swapchainDepthImages;
     VkDeviceMemory[] swapchainDepthMemories;
     VkImageView[] swapchainDepthImageViews;
+    bool[] swapchainImageInitialized;
     VkFramebuffer[] framebuffers;
 
     VkRenderPass renderPass;
     VkRenderPass offscreenRenderPass;
     VkDescriptorSetLayout descriptorSetLayout;
-    VkDescriptorPool descriptorPool;
+    VkDescriptorPool[] descriptorPools;
+    VkDescriptorPool activeDescriptorPool;
     VkPipelineLayout pipelineLayout;
     VkPipeline[cast(size_t)BlendMode.Count][cast(size_t)PipelineKind.Count] pipelines;
     VkPipeline[cast(size_t)BlendMode.Count][cast(size_t)PipelineKind.Count] offscreenPipelines;
@@ -421,8 +460,9 @@ private:
 
     enum MaxFramesInFlight = 2;
     VkSemaphore[MaxFramesInFlight] imageAvailable;
-    VkSemaphore[MaxFramesInFlight] renderFinished;
+    VkSemaphore[] renderFinishedByImage;
     VkFence[MaxFramesInFlight] inFlight;
+    VkFence[] inFlightByImage;
     uint frameIndex;
 
     VkBuffer vertexBuffer;
@@ -451,6 +491,7 @@ private:
     VkTextureResource[size_t] textureResources;
     VkTextureResource fallbackWhite;
     VkTextureResource fallbackBlack;
+    bool textureMutationSynced;
 
     const(SharedBufferSnapshot)* currentSnapshot;
 
@@ -484,22 +525,27 @@ public:
 
         foreach (i; 0 .. MaxFramesInFlight) {
             if (imageAvailable[i] != VK_NULL_HANDLE) vkDestroySemaphore(device, imageAvailable[i], null);
-            if (renderFinished[i] != VK_NULL_HANDLE) vkDestroySemaphore(device, renderFinished[i], null);
             if (inFlight[i] != VK_NULL_HANDLE) vkDestroyFence(device, inFlight[i], null);
         }
 
         if (commandPool != VK_NULL_HANDLE) vkDestroyCommandPool(device, commandPool, null);
+        if (debugMessenger != VK_NULL_HANDLE && instance != VK_NULL_HANDLE) {
+            vkDestroyDebugUtilsMessengerEXT(instance, debugMessenger, null);
+        }
         if (device != VK_NULL_HANDLE) vkDestroyDevice(device, null);
         if (surface != VK_NULL_HANDLE) vkDestroySurfaceKHR(instance, surface, null);
         if (instance != VK_NULL_HANDLE) vkDestroyInstance(instance, null);
 
         imageAvailable[] = VK_NULL_HANDLE;
-        renderFinished[] = VK_NULL_HANDLE;
         inFlight[] = VK_NULL_HANDLE;
+        renderFinishedByImage.length = 0;
+        inFlightByImage.length = 0;
         commandPool = VK_NULL_HANDLE;
         device = VK_NULL_HANDLE;
         surface = VK_NULL_HANDLE;
         instance = VK_NULL_HANDLE;
+        debugMessenger = VK_NULL_HANDLE;
+        validationEnabled = false;
 
         // The Vulkan loader may be owned by another component (e.g. capture tooling).
         // Do not force dlclose here to avoid invalid-handle crashes on shutdown paths.
@@ -561,6 +607,7 @@ public:
     }
 
     void beginScene() {
+        textureMutationSynced = false;
         pruneTextureCache();
         cpuVertices.length = 0;
         cpuIndices.length = 0;
@@ -609,11 +656,11 @@ public:
         pendingMaskStencilClear = false;
     }
 
-    void applyMask(ref const(NjgMaskApplyPacket) packet, Texture[size_t] texturesByHandle) {
+    void applyMask(ref const(NjgMaskApplyPacket) packet) {
         if (!maskBuildActive || !maskStencilAvailable) return;
         pendingMaskWriteReference = packet.isDodge ? 0u : 1u;
         if (packet.kind == MaskDrawableKind.Part) {
-            drawPartPacket(packet.partPacket, texturesByHandle);
+            drawPartPacket(packet.partPacket);
         } else {
             drawMaskPacket(packet.maskPacket);
         }
@@ -674,8 +721,7 @@ public:
         return 0;
     }
 
-    void drawPartPacket(ref const(NjgPartDrawPacket) packet,
-                        Texture[size_t] texturesByHandle)
+    void drawPartPacket(ref const(NjgPartDrawPacket) packet)
     {
         if (packet.indexCount == 0 || packet.vertexCount == 0) return;
         if (currentSnapshot is null) return;
@@ -852,6 +898,8 @@ public:
 
 private:
     void createInstance() {
+        validationEnabled = envEnabled("NJIV_VK_VALIDATION");
+
         uint extCount = 0;
         enforce(SDL_Vulkan_GetInstanceExtensions(window, &extCount, null) == SDL_TRUE,
             "SDL_Vulkan_GetInstanceExtensions (count) failed");
@@ -872,10 +920,46 @@ private:
                 extNames ~= "VK_KHR_portability_enumeration";
             }
         }
+        if (validationEnabled && !extNames.canFind("VK_EXT_debug_utils")) {
+            extNames ~= "VK_EXT_debug_utils";
+        }
 
         const(char)*[] instExts;
         instExts.length = extNames.length;
         foreach (i, name; extNames) instExts[i] = name.toStringz();
+
+        const(char)*[] instanceLayers;
+        if (validationEnabled) {
+            uint32_t layerCount = 0;
+            auto layerEnumRes = vkEnumerateInstanceLayerProperties(&layerCount, null);
+            if (layerEnumRes == VK_SUCCESS && layerCount > 0) {
+                VkLayerProperties[] layers;
+                layers.length = layerCount;
+                layerEnumRes = vkEnumerateInstanceLayerProperties(&layerCount, layers.ptr);
+                if (layerEnumRes == VK_SUCCESS) {
+                    bool hasValidationLayer = false;
+                    foreach (layer; layers) {
+                        auto layerName = fromStringz(layer.layerName.ptr);
+                        if (layerName == "VK_LAYER_KHRONOS_validation") {
+                            hasValidationLayer = true;
+                            break;
+                        }
+                    }
+                    if (hasValidationLayer) {
+                        instanceLayers ~= "VK_LAYER_KHRONOS_validation".toStringz();
+                    } else {
+                        validationEnabled = false;
+                        writeln("[vulkan] validation requested but VK_LAYER_KHRONOS_validation is unavailable");
+                    }
+                } else {
+                    validationEnabled = false;
+                    writeln("[vulkan] validation requested but instance layer enumeration failed");
+                }
+            } else {
+                validationEnabled = false;
+                writeln("[vulkan] validation requested but no instance layers are available");
+            }
+        }
 
         VkApplicationInfo appInfo;
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -890,6 +974,8 @@ private:
         createInfo.pApplicationInfo = &appInfo;
         createInfo.enabledExtensionCount = cast(uint32_t)instExts.length;
         createInfo.ppEnabledExtensionNames = instExts.ptr;
+        createInfo.enabledLayerCount = cast(uint32_t)instanceLayers.length;
+        createInfo.ppEnabledLayerNames = instanceLayers.length > 0 ? instanceLayers.ptr : null;
 
         version (OSX) {
             createInfo.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
@@ -897,6 +983,25 @@ private:
 
         vkEnforce(vkCreateInstance(&createInfo, null, &instance), "vkCreateInstance failed");
         loadInstanceLevelFunctions(instance);
+
+        if (validationEnabled) {
+            VkDebugUtilsMessengerCreateInfoEXT debugInfo;
+            debugInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+            debugInfo.messageSeverity =
+                VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
+                VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+            debugInfo.messageType =
+                VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
+                VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
+                VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
+            debugInfo.pfnUserCallback = &vulkanValidationCallback;
+            auto dbgRes = vkCreateDebugUtilsMessengerEXT(instance, &debugInfo, null, &debugMessenger);
+            if (dbgRes != VK_SUCCESS) {
+                writeln("[vulkan] vkCreateDebugUtilsMessengerEXT failed: ", dbgRes);
+                validationEnabled = false;
+                debugMessenger = VK_NULL_HANDLE;
+            }
+        }
     }
 
     void createSurface() {
@@ -1033,8 +1138,23 @@ private:
 
         foreach (i; 0 .. MaxFramesInFlight) {
             vkEnforce(vkCreateSemaphore(device, &semInfo, null, &imageAvailable[i]), "vkCreateSemaphore imageAvailable failed");
-            vkEnforce(vkCreateSemaphore(device, &semInfo, null, &renderFinished[i]), "vkCreateSemaphore renderFinished failed");
             vkEnforce(vkCreateFence(device, &fenceInfo, null, &inFlight[i]), "vkCreateFence failed");
+        }
+    }
+
+    void createSwapchainSyncObjects() {
+        VkSemaphoreCreateInfo semInfo;
+        semInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+        renderFinishedByImage.length = swapchainImages.length;
+        foreach (i; 0 .. renderFinishedByImage.length) {
+            vkEnforce(vkCreateSemaphore(device, &semInfo, null, &renderFinishedByImage[i]),
+                "vkCreateSemaphore renderFinishedByImage failed");
+        }
+
+        inFlightByImage.length = swapchainImages.length;
+        foreach (i; 0 .. inFlightByImage.length) {
+            inFlightByImage[i] = VK_NULL_HANDLE;
         }
     }
 
@@ -1118,7 +1238,12 @@ private:
         vkEnforce(vkGetSwapchainImagesKHR(device, swapchain, &scImageCount, null), "vkGetSwapchainImagesKHR count failed");
         swapchainImages.length = scImageCount;
         vkEnforce(vkGetSwapchainImagesKHR(device, swapchain, &scImageCount, swapchainImages.ptr), "vkGetSwapchainImagesKHR failed");
+        swapchainImageInitialized.length = scImageCount;
+        foreach (i; 0 .. swapchainImageInitialized.length) {
+            swapchainImageInitialized[i] = false;
+        }
 
+        createSwapchainSyncObjects();
         createSwapchainImageViews();
         createSwapchainDepthResources();
         createRenderPasses();
@@ -1133,6 +1258,12 @@ private:
         }
         framebuffers.length = 0;
 
+        foreach (sem; renderFinishedByImage) {
+            if (sem != VK_NULL_HANDLE) vkDestroySemaphore(device, sem, null);
+        }
+        renderFinishedByImage.length = 0;
+        inFlightByImage.length = 0;
+
         foreach (k; 0 .. pipelines.length) {
             foreach (m; 0 .. pipelines[k].length) {
                 if (pipelines[k][m] != VK_NULL_HANDLE) vkDestroyPipeline(device, pipelines[k][m], null);
@@ -1142,12 +1273,15 @@ private:
             }
         }
         if (pipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(device, pipelineLayout, null);
-        if (descriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, descriptorPool, null);
+        foreach (pool; descriptorPools) {
+            if (pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, pool, null);
+        }
         if (descriptorSetLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, descriptorSetLayout, null);
         if (renderPass != VK_NULL_HANDLE) vkDestroyRenderPass(device, renderPass, null);
         if (offscreenRenderPass != VK_NULL_HANDLE) vkDestroyRenderPass(device, offscreenRenderPass, null);
         pipelineLayout = VK_NULL_HANDLE;
-        descriptorPool = VK_NULL_HANDLE;
+        descriptorPools.length = 0;
+        activeDescriptorPool = VK_NULL_HANDLE;
         descriptorSetLayout = VK_NULL_HANDLE;
         renderPass = VK_NULL_HANDLE;
         offscreenRenderPass = VK_NULL_HANDLE;
@@ -1169,6 +1303,7 @@ private:
         swapchainDepthImageViews.length = 0;
         swapchainDepthImages.length = 0;
         swapchainDepthMemories.length = 0;
+        swapchainImageInitialized.length = 0;
         swapchainImages.length = 0;
 
         if (swapchain != VK_NULL_HANDLE) {
@@ -1290,6 +1425,7 @@ private:
         vkEnforce(vkCreateRenderPass(device, &info, null, &renderPass), "vkCreateRenderPass(swapchain) failed");
 
         VkAttachmentDescription offColor = attachments[0];
+        offColor.format = VK_FORMAT_R8G8B8A8_UNORM;
         offColor.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         offColor.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         VkSubpassDescription offSubpass;
@@ -1471,9 +1607,15 @@ private:
 
         VkPipelineRasterizationStateCreateInfo raster;
         raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        raster.depthClampEnable = VK_FALSE;
+        raster.rasterizerDiscardEnable = VK_FALSE;
         raster.polygonMode = VK_POLYGON_MODE_FILL;
         raster.cullMode = VK_CULL_MODE_NONE;
         raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        raster.depthBiasEnable = VK_FALSE;
+        raster.depthBiasConstantFactor = 0;
+        raster.depthBiasClamp = 0;
+        raster.depthBiasSlopeFactor = 0;
         raster.lineWidth = 1;
 
         VkPipelineMultisampleStateCreateInfo ms;
@@ -1790,8 +1932,12 @@ private:
         poolInfo.maxSets = 8192;
         poolInfo.poolSizeCount = 1;
         poolInfo.pPoolSizes = &poolSize;
-        vkEnforce(vkCreateDescriptorPool(device, &poolInfo, null, &descriptorPool),
-            "vkCreateDescriptorPool failed");
+        descriptorPools.length = MaxFramesInFlight;
+        foreach (i; 0 .. MaxFramesInFlight) {
+            vkEnforce(vkCreateDescriptorPool(device, &poolInfo, null, &descriptorPools[i]),
+                "vkCreateDescriptorPool failed");
+        }
+        activeDescriptorPool = descriptorPools[0];
     }
 
     VkCommandBuffer beginSingleTimeCommands() {
@@ -1822,9 +1968,12 @@ private:
         vkFreeCommandBuffers(device, commandPool, 1, &cmd);
     }
 
-    void transitionImageLayout(VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout) {
-        auto cmd = beginSingleTimeCommands();
-        VkImageMemoryBarrier barrier;
+    private void fillImageLayoutTransitionBarrier(ref VkImageMemoryBarrier barrier,
+                                                  out VkPipelineStageFlags srcStage,
+                                                  out VkPipelineStageFlags dstStage,
+                                                  VkImage image,
+                                                  VkImageLayout oldLayout,
+                                                  VkImageLayout newLayout) {
         barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         barrier.oldLayout = oldLayout;
         barrier.newLayout = newLayout;
@@ -1837,8 +1986,6 @@ private:
         barrier.subresourceRange.baseArrayLayer = 0;
         barrier.subresourceRange.layerCount = 1;
 
-        VkPipelineStageFlags srcStage;
-        VkPipelineStageFlags dstStage;
         if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
             barrier.srcAccessMask = 0;
             barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1865,6 +2012,59 @@ private:
             srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
             dstStage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
         }
+    }
+
+    void initializeSwapchainImageLayouts(uint32_t imageIndex) {
+        if (imageIndex >= swapchainImages.length || imageIndex >= swapchainDepthImages.length) return;
+        auto cmd = beginSingleTimeCommands();
+
+        VkImageMemoryBarrier colorBarrier;
+        colorBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        colorBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        colorBarrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        colorBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        colorBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        colorBarrier.image = swapchainImages[imageIndex];
+        colorBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        colorBarrier.subresourceRange.baseMipLevel = 0;
+        colorBarrier.subresourceRange.levelCount = 1;
+        colorBarrier.subresourceRange.baseArrayLayer = 0;
+        colorBarrier.subresourceRange.layerCount = 1;
+
+        VkImageMemoryBarrier depthBarrier;
+        depthBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        depthBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        depthBarrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depthBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        depthBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        depthBarrier.image = swapchainDepthImages[imageIndex];
+        depthBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+        depthBarrier.subresourceRange.baseMipLevel = 0;
+        depthBarrier.subresourceRange.levelCount = 1;
+        depthBarrier.subresourceRange.baseArrayLayer = 0;
+        depthBarrier.subresourceRange.layerCount = 1;
+        depthBarrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+        VkImageMemoryBarrier[2] barriers = [colorBarrier, depthBarrier];
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+                             0,
+                             0, null,
+                             0, null,
+                             cast(uint32_t)barriers.length, barriers.ptr);
+        endSingleTimeCommands(cmd);
+    }
+
+    private void recordImageLayoutTransition(VkCommandBuffer cmd,
+                                             VkImage image,
+                                             VkImageLayout oldLayout,
+                                             VkImageLayout newLayout) {
+        VkImageMemoryBarrier barrier;
+        VkPipelineStageFlags srcStage;
+        VkPipelineStageFlags dstStage;
+        fillImageLayoutTransitionBarrier(barrier, srcStage, dstStage, image, oldLayout, newLayout);
 
         vkCmdPipelineBarrier(cmd,
                              srcStage,
@@ -1873,6 +2073,11 @@ private:
                              0, null,
                              0, null,
                              1, &barrier);
+    }
+
+    void transitionImageLayout(VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout) {
+        auto cmd = beginSingleTimeCommands();
+        recordImageLayoutTransition(cmd, image, oldLayout, newLayout);
         endSingleTimeCommands(cmd);
     }
 
@@ -2017,6 +2222,12 @@ private:
         tex = VkTextureResource.init;
     }
 
+    private void syncBeforeTextureMutation() {
+        if (textureMutationSynced) return;
+        vkEnforce(vkDeviceWaitIdle(device), "vkDeviceWaitIdle(texture mutation) failed");
+        textureMutationSynced = true;
+    }
+
     VkTextureResource uploadTextureDataToGpu(const(Texture) tex) {
         auto rgba = toRgbaBytes(tex);
         auto width = cast(uint32_t)max(1, tex.width);
@@ -2095,30 +2306,46 @@ private:
         if (handle == 0) {
             return wantBlackFallback ? &fallbackBlack : &fallbackWhite;
         }
-        if (auto tex = handle in gTextures) {
-            if (*tex is null) return wantBlackFallback ? &fallbackBlack : &fallbackWhite;
-            if (auto cached = handle in textureResources) {
-                if (cached.revision == (*tex).revision() &&
-                    cached.width == (*tex).width &&
-                    cached.height == (*tex).height &&
-                    cached.channels == (*tex).channels) {
-                    return cached;
+        synchronized (gTexturesGuard) {
+            if (auto tex = handle in gTextures) {
+                if (*tex is null) {
+                    return wantBlackFallback ? &fallbackBlack : &fallbackWhite;
                 }
-                auto old = *cached;
-                destroyTextureResource(old);
+                if (auto cached = handle in textureResources) {
+                    if (cached.revision == (*tex).revision() &&
+                        cached.width == (*tex).width &&
+                        cached.height == (*tex).height &&
+                        cached.channels == (*tex).channels) {
+                        return cached;
+                    }
+                    syncBeforeTextureMutation();
+                    auto old = *cached;
+                    destroyTextureResource(old);
+                }
+                auto uploaded = uploadTextureDataToGpu(*tex);
+                textureResources[handle] = uploaded;
+                return handle in textureResources;
             }
-            auto uploaded = uploadTextureDataToGpu(*tex);
-            textureResources[handle] = uploaded;
-            return handle in textureResources;
         }
         return wantBlackFallback ? &fallbackBlack : &fallbackWhite;
     }
 
+    VkTextureResource snapshotTextureHandle(size_t handle, bool wantBlackFallback = false) {
+        auto texRes = resolveTextureHandle(handle, wantBlackFallback);
+        if (texRes is null) {
+            return wantBlackFallback ? fallbackBlack : fallbackWhite;
+        }
+        return *texRes;
+    }
+
     VkDescriptorSet allocateBatchDescriptorSet(ref const(DrawBatch) batch) {
+        if (activeDescriptorPool == VK_NULL_HANDLE) {
+            return VK_NULL_HANDLE;
+        }
         VkDescriptorSetLayout setLayout = descriptorSetLayout;
         VkDescriptorSetAllocateInfo alloc;
         alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-        alloc.descriptorPool = descriptorPool;
+        alloc.descriptorPool = activeDescriptorPool;
         alloc.descriptorSetCount = 1;
         alloc.pSetLayouts = &setLayout;
         VkDescriptorSet set;
@@ -2128,7 +2355,13 @@ private:
         foreach (i; 0 .. 3) {
             bool blackFallback = (i != 0);
             size_t handle = (i < batch.textureCount) ? batch.textureHandles[i] : 0;
-            auto texRes = resolveTextureHandle(handle, blackFallback);
+            // Vulkan forbids sampling from an image while simultaneously writing to it
+            // as a color attachment in the same subpass.
+            if (batch.targetHandle != 0 && handle == batch.targetHandle) {
+                handle = 0;
+                blackFallback = true;
+            }
+            auto texRes = snapshotTextureHandle(handle, blackFallback);
             infos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             infos[i].imageView = texRes.view;
             infos[i].sampler = texRes.sampler;
@@ -2151,12 +2384,17 @@ private:
     void pruneTextureCache() {
         size_t[] stale;
         foreach (h, _res; textureResources) {
-            if ((h in gTextures) is null) {
+            bool alive = false;
+            synchronized (gTexturesGuard) {
+                alive = (h in gTextures) !is null;
+            }
+            if (!alive) {
                 stale ~= h;
             }
         }
         foreach (h; stale) {
             if (auto res = h in textureResources) {
+                syncBeforeTextureMutation();
                 auto tmp = *res;
                 destroyTextureResource(tmp);
             }
@@ -2369,6 +2607,7 @@ private:
                         vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, b.stencilReference);
                     }
                     auto dset = allocateBatchDescriptorSet(b);
+                    if (dset == VK_NULL_HANDLE) continue;
                     vkCmdBindDescriptorSets(cmd,
                                             VK_PIPELINE_BIND_POINT_GRAPHICS,
                                             pipelineLayout,
@@ -2410,24 +2649,30 @@ private:
                     rootTouched = true;
                 } else {
                     auto texRes = resolveTextureHandle(target, false);
-                    if (texRes is null || !texRes.renderTarget) {
+                    if (texRes is null || !texRes.renderTarget || texRes.image == VK_NULL_HANDLE) {
                         continue;
                     }
-                    transitionImageLayout(texRes.image,
-                                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                          VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+                    auto targetImage = texRes.image;
                     auto fb = getOrCreateOffscreenFramebuffer(*texRes);
+                    if (fb == VK_NULL_HANDLE) continue;
+                    auto targetWidth = texRes.width;
+                    auto targetHeight = texRes.height;
+                    recordImageLayoutTransition(cmd,
+                                                targetImage,
+                                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
                     VkExtent2D extent;
-                    extent.width = cast(uint32_t)max(1, texRes.width);
-                    extent.height = cast(uint32_t)max(1, texRes.height);
+                    extent.width = cast(uint32_t)max(1, targetWidth);
+                    extent.height = cast(uint32_t)max(1, targetHeight);
                     bool touched = false;
                     if (auto p = target in targetTouched) touched = *p;
                     bool shouldClear = !touched || batches[start].clearTarget;
                     renderBatchRange(start, stop, offscreenRenderPass, fb, extent, shouldClear, true);
                     targetTouched[target] = true;
-                    transitionImageLayout(texRes.image,
-                                          VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                          VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                    recordImageLayoutTransition(cmd,
+                                                targetImage,
+                                                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                 }
             }
         }
@@ -2451,9 +2696,22 @@ private:
         }
         vkEnforce(acquire, "vkAcquireNextImageKHR failed");
 
+        if (imageIndex < inFlightByImage.length && inFlightByImage[imageIndex] != VK_NULL_HANDLE) {
+            vkWaitForFences(device, 1, &inFlightByImage[imageIndex], VK_TRUE, ulong.max);
+        }
+        if (imageIndex < swapchainImageInitialized.length && !swapchainImageInitialized[imageIndex]) {
+            initializeSwapchainImageLayouts(imageIndex);
+            swapchainImageInitialized[imageIndex] = true;
+        }
+        if (imageIndex < inFlightByImage.length) {
+            inFlightByImage[imageIndex] = inFlight[frameIndex];
+        }
+
         vkResetFences(device, 1, &inFlight[frameIndex]);
         vkResetCommandBuffer(commandBuffers[imageIndex], 0);
-        vkResetDescriptorPool(device, descriptorPool, 0);
+        enforce(frameIndex < descriptorPools.length, "Invalid frameIndex for descriptor pool");
+        activeDescriptorPool = descriptorPools[frameIndex];
+        vkEnforce(vkResetDescriptorPool(device, activeDescriptorPool, 0), "vkResetDescriptorPool failed");
 
         uploadGeometry();
         recordCommandBuffer(commandBuffers[imageIndex], imageIndex);
@@ -2467,13 +2725,14 @@ private:
         submit.commandBufferCount = 1;
         submit.pCommandBuffers = &commandBuffers[imageIndex];
         submit.signalSemaphoreCount = 1;
-        submit.pSignalSemaphores = &renderFinished[frameIndex];
+        auto signalSemaphore = renderFinishedByImage[imageIndex];
+        submit.pSignalSemaphores = &signalSemaphore;
         vkEnforce(vkQueueSubmit(graphicsQueue, 1, &submit, inFlight[frameIndex]), "vkQueueSubmit failed");
 
         VkPresentInfoKHR present;
         present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         present.waitSemaphoreCount = 1;
-        present.pWaitSemaphores = &renderFinished[frameIndex];
+        present.pWaitSemaphores = &signalSemaphore;
         present.swapchainCount = 1;
         present.pSwapchains = &swapchain;
         present.pImageIndices = &imageIndex;
@@ -2491,6 +2750,7 @@ private:
 
 /// Initialize SDL, Vulkan loader/device, create window and renderer callbacks.
 VulkanBackendInit initVulkanBackend(int width, int height, bool isTest) {
+    ensureDThreadAttached();
     auto support = loadSDL();
     if (support == SDLSupport.noLibrary || support == SDLSupport.badLibrary) {
         version (OSX) {
@@ -2517,24 +2777,35 @@ VulkanBackendInit initVulkanBackend(int width, int height, bool isTest) {
     UnityResourceCallbacks cbs;
     cbs.userData = window;
     cbs.createTexture = (int w, int h, int channels, int mipLevels, int format, bool renderTarget, bool stencil, void* userData) {
-        size_t handle = gNextHandle++;
-        gTextures[handle] = new Texture(w, h, channels, stencil, renderTarget);
+        ensureDThreadAttached();
+        size_t handle = 0;
+        synchronized (gTexturesGuard) {
+            handle = gNextHandle++;
+            gTextures[handle] = new Texture(w, h, channels, stencil, renderTarget);
+        }
         return handle;
     };
     cbs.updateTexture = (size_t handle, const(ubyte)* data, size_t dataLen, int w, int h, int channels, void* userData) {
-        if (auto tex = handle in gTextures) {
-            if (*tex is null || data is null) return;
-            auto expected = cast(size_t)w * cast(size_t)h * cast(size_t)max(1, channels);
-            if (expected == 0 || dataLen < expected) return;
-            (*tex).width = w;
-            (*tex).height = h;
-            (*tex).setData(data[0 .. expected], channels);
+        ensureDThreadAttached();
+        if (data is null) return;
+        auto expected = cast(size_t)w * cast(size_t)h * cast(size_t)max(1, channels);
+        if (expected == 0 || dataLen < expected) return;
+        synchronized (gTexturesGuard) {
+            if (auto tex = handle in gTextures) {
+                if (*tex is null) return;
+                (*tex).width = w;
+                (*tex).height = h;
+                (*tex).setData(data[0 .. expected], channels);
+            }
         }
     };
     cbs.releaseTexture = (size_t handle, void* userData) {
-        if (auto tex = handle in gTextures) {
-            if (*tex !is null) (*tex).dispose();
-            gTextures.remove(handle);
+        ensureDThreadAttached();
+        synchronized (gTexturesGuard) {
+            if (auto tex = handle in gTextures) {
+                if (*tex !is null) (*tex).dispose();
+                gTextures.remove(handle);
+            }
         }
     };
 
@@ -2546,6 +2817,7 @@ void renderCommands(const VulkanBackendInit* vk,
                     const SharedBufferSnapshot* snapshot,
                     const CommandQueueView* view)
 {
+    ensureDThreadAttached();
     if (vk is null || vk.backend is null || view is null) return;
 
     auto backend = cast(RenderingBackend)vk.backend;
@@ -2556,7 +2828,7 @@ void renderCommands(const VulkanBackendInit* vk,
     foreach (cmd; cmds) {
         final switch (cmd.kind) {
             case NjgRenderCommandKind.DrawPart:
-                backend.drawPartPacket(cmd.partPacket, gTextures);
+                backend.drawPartPacket(cmd.partPacket);
                 break;
             case NjgRenderCommandKind.DrawMask:
                 break;
@@ -2570,7 +2842,7 @@ void renderCommands(const VulkanBackendInit* vk,
                 backend.beginMask(cmd.usesStencil);
                 break;
             case NjgRenderCommandKind.ApplyMask:
-                backend.applyMask(cmd.maskApplyPacket, gTextures);
+                backend.applyMask(cmd.maskApplyPacket);
                 break;
             case NjgRenderCommandKind.BeginMaskContent:
                 backend.beginMaskContent();

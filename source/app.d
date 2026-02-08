@@ -291,7 +291,6 @@ void main(string[] args) {
     auto api = loadUnityApi(libPath);
     // Do not unload the shared runtime-bound DLL during process lifetime.
     if (api.rtInit !is null) api.rtInit();
-    scope (exit) if (api.rtTerm !is null) api.rtTerm();
     if (api.setLogCallback !is null) {
         api.setLogCallback(&logCallback, null);
     }
@@ -422,20 +421,16 @@ void main(string[] args) {
 
     version (EnableDirectXBackend) {
         gfx.shutdownDirectXBackend(backendInit);
-    } else version (EnableVulkanBackend) {
-        if (backendInit.backend !is null) {
-            backendInit.backend.dispose();
-        }
     }
 
     api.unloadPuppet(renderer, puppet);
     api.destroyRenderer(renderer);
-    if (api.rtTerm !is null) {
-        api.rtTerm();
-    }
-    Runtime.unloadLibrary(api.lib);
+    // Keep DLL runtime alive until process exit to avoid shutdown-order crashes.
 
     version (EnableDirectXBackend) {
+        import core.stdc.stdlib : _Exit;
+        _Exit(0);
+    } else version (EnableVulkanBackend) {
         import core.stdc.stdlib : _Exit;
         _Exit(0);
     }
