@@ -319,6 +319,21 @@ private void vkEnforce(VkResult result, string message) {
     enforce(result == VK_SUCCESS, message ~ " (VkResult=" ~ result.to!string ~ ")");
 }
 
+private VkCompositeAlphaFlagBitsKHR chooseCompositeAlpha(VkCompositeAlphaFlagsKHR supported) {
+    VkCompositeAlphaFlagBitsKHR[4] preferred = [
+        VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
+        VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR,
+        VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR,
+        VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
+    ];
+    foreach (mode; preferred) {
+        if ((supported & cast(VkCompositeAlphaFlagsKHR)mode) != 0) {
+            return mode;
+        }
+    }
+    return VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+}
+
 private bool envEnabled(string name) {
     auto value = environment.get(name, "");
     return value == "1" || value == "true" || value == "TRUE";
@@ -1177,12 +1192,22 @@ private:
             "vkGetPhysicalDeviceSurfaceFormatsKHR failed");
 
         VkSurfaceFormatKHR chosen = formats[0];
-        foreach (f; formats) {
-            if (f.format == VK_FORMAT_B8G8R8A8_UNORM &&
-                f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-                chosen = f;
-                break;
+        VkFormat[3] preferredFormats = [
+            VK_FORMAT_B8G8R8A8_UNORM,
+            VK_FORMAT_R8G8B8A8_UNORM,
+            VK_FORMAT_B8G8R8A8_SRGB
+        ];
+        bool foundPreferred = false;
+        foreach (fmt; preferredFormats) {
+            foreach (f; formats) {
+                if (f.format == fmt &&
+                    f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+                    chosen = f;
+                    foundPreferred = true;
+                    break;
+                }
             }
+            if (foundPreferred) break;
         }
         swapchainFormat = chosen.format;
 
@@ -1227,7 +1252,9 @@ private:
             scInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         }
         scInfo.preTransform = caps.currentTransform;
-        scInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+        scInfo.compositeAlpha = chooseCompositeAlpha(caps.supportedCompositeAlpha);
+        writeln("[vulkan] supportedCompositeAlpha=", cast(uint)caps.supportedCompositeAlpha,
+            " chosen=", cast(uint)scInfo.compositeAlpha);
         scInfo.presentMode = presentMode;
         scInfo.clipped = VK_TRUE;
         scInfo.oldSwapchain = VK_NULL_HANDLE;

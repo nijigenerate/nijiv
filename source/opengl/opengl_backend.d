@@ -13,6 +13,7 @@ import opengl.opengl_thumb : currentDebugTextureBackend;
 import bindbc.opengl.context;
 
 import std.algorithm : min;
+import core.sys.posix.dlfcn : dlopen, dlsym, RTLD_NOW, RTLD_LOCAL;
 
 import std.algorithm.comparison : max;
 import std.algorithm.mutation : swap;
@@ -242,6 +243,33 @@ public vec4 inClearColor = vec4(0, 0, 0, 0);
 vec3 inSceneAmbientLight = vec3(1, 1, 1);
 
 private __gshared RenderBackend cachedRenderBackend;
+
+version (OSX) {
+    private void configureMacOpenGLSurfaceOpacity(SDL_GLContext glContext) {
+        if (glContext is null) return;
+
+        alias ObjcId = void*;
+        alias ObjcSel = void*;
+        alias ObjcRegisterSelFn = extern(C) ObjcSel function(const(char)*);
+        alias MsgSendSetValuesFn = extern(C) void function(ObjcId, ObjcSel, const(int)*, int);
+
+        auto objcHandle = dlopen("/usr/lib/libobjc.A.dylib".toStringz, RTLD_NOW | RTLD_LOCAL);
+        if (objcHandle is null) return;
+
+        auto selRegisterName = cast(ObjcRegisterSelFn)dlsym(objcHandle, "sel_registerName".toStringz);
+        auto objcMsgSendRaw = dlsym(objcHandle, "objc_msgSend".toStringz);
+        if (selRegisterName is null || objcMsgSendRaw is null) return;
+
+        auto msgSendSetValues = cast(MsgSendSetValuesFn)objcMsgSendRaw;
+        auto selSetValuesForParameter = selRegisterName("setValues:forParameter:".toStringz);
+        if (selSetValuesForParameter is null) return;
+
+        // NSOpenGLCPSurfaceOpacity
+        enum NSOpenGLCPSurfaceOpacity = 236;
+        int zero = 0;
+        msgSendSetValues(cast(ObjcId)glContext, selSetValuesForParameter, &zero, NSOpenGLCPSurfaceOpacity);
+    }
+}
 
 private void ensureRenderBackend() {
     if (cachedRenderBackend is null) {
@@ -2267,6 +2295,7 @@ OpenGLBackendInit initOpenGLBackend(int width, int height, bool isTest) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 8);
 
     auto window = SDL_CreateWindow("nijiv",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
@@ -2277,6 +2306,9 @@ OpenGLBackendInit initOpenGLBackend(int width, int height, bool isTest) {
     auto glContext = SDL_GL_CreateContext(window);
     enforce(glContext !is null, "SDL_GL_CreateContext failed: "~sdlError());
     SDL_GL_MakeCurrent(window, glContext);
+    version (OSX) {
+        configureMacOpenGLSurfaceOpacity(glContext);
+    }
     auto glSupport = loadOpenGL();
     enforce(glSupport >= GLSupport.gl32, "Failed to load OpenGL bindings (support="~glSupport.to!string~")");
     SDL_GL_SetSwapInterval(1);
@@ -2436,14 +2468,16 @@ void renderCommands(const OpenGLBackendInit* gl,
     glBlitFramebuffer(0, 0, gl.drawableW, gl.drawableH,
                       0, 0, gl.drawableW, gl.drawableH,
                       GL_COLOR_BUFFER_BIT, GL_LINEAR);
-    GLuint[] thumbTextureIds;
-    thumbTextureIds.reserve(gTextures.length);
-    foreach (_handle, tex; gTextures) {
-        if (tex !is null) {
-            thumbTextureIds ~= cast(GLuint)tex.getTextureId();
-        }
-    }
-    debugTextureBackend.renderThumbnailGrid(gl.drawableW, gl.drawableH, thumbTextureIds);
+    // NOTE: Disabled per request. This debug overlay rewrites final pixels,
+    // which interferes with transparent-window verification.
+    // GLuint[] thumbTextureIds;
+    // thumbTextureIds.reserve(gTextures.length);
+    // foreach (_handle, tex; gTextures) {
+    //     if (tex !is null) {
+    //         thumbTextureIds ~= cast(GLuint)tex.getTextureId();
+    //     }
+    // }
+    // debugTextureBackend.renderThumbnailGrid(gl.drawableW, gl.drawableH, thumbTextureIds);
     // Avoid leaking GL state into the next frame.
     glUseProgram(0);
     glBindVertexArray(0);

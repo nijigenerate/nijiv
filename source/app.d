@@ -5,8 +5,8 @@ import std.conv : to;
 import std.exception : enforce;
 import std.file : exists, getcwd;
 import std.path : buildPath, dirName;
-import std.stdio : writeln, writefln;
-import std.string : fromStringz, toStringz, endsWith;
+import std.stdio : writeln, writefln, stderr;
+import std.string : fromStringz, toStringz, endsWith, toLower;
 import std.math : exp;
 import std.algorithm : clamp;
 
@@ -189,20 +189,66 @@ bool isEnvEnabled(string name) {
     return v == "1" || v == "true" || v == "TRUE";
 }
 
-void main(string[] args) {
+enum ToggleOption {
+    Unspecified,
+    Enabled,
+    Disabled,
+}
+
+struct CliOptions {
     bool isTest = false;
-    string[] positional;
     int framesFlag = -1;
+    ToggleOption transparentWindow = ToggleOption.Unspecified;
+    ToggleOption transparentRetry = ToggleOption.Unspecified;
+    ToggleOption transparentDebug = ToggleOption.Unspecified;
+    string[] positional;
+}
+
+private __gshared bool gTransparentDebugLog = false;
+
+private void transparentDebug(string message) {
+    if (!gTransparentDebugLog) return;
+    stderr.writeln(message);
+    stderr.flush();
+}
+
+private bool tryParseEnvBool(string name, out bool value) {
     import core.stdc.stdlib : getenv;
-    import std.string : fromStringz;
-    import std.conv : to;
-    // Defaults for test mode
-    int testMaxFrames = 5;
-    auto testTimeout = 5.seconds;
+    auto p = getenv(name.toStringz);
+    if (p is null) return false;
+    auto v = fromStringz(p).idup.toLower();
+    if (v == "1" || v == "true" || v == "yes" || v == "on") {
+        value = true;
+        return true;
+    }
+    if (v == "0" || v == "false" || v == "no" || v == "off") {
+        value = false;
+        return true;
+    }
+    return false;
+}
+
+private bool resolveToggle(ToggleOption cliValue, string envName, bool defaultValue) {
+    final switch (cliValue) {
+        case ToggleOption.Enabled:
+            return true;
+        case ToggleOption.Disabled:
+            return false;
+        case ToggleOption.Unspecified:
+            bool envValue;
+            if (tryParseEnvBool(envName, envValue)) {
+                return envValue;
+            }
+            return defaultValue;
+    }
+}
+
+private CliOptions parseCliOptions(string[] args) {
+    CliOptions out_;
     for (size_t i = 1; i < args.length; ++i) {
         auto arg = args[i];
         if (arg == "--test") {
-            isTest = true;
+            out_.isTest = true;
             continue;
         }
         if (arg == "--frames") {
@@ -211,16 +257,330 @@ void main(string[] args) {
                 import std.algorithm : all;
                 auto maybe = args[i + 1];
                 if (maybe.all!isDigit) {
-                    framesFlag = maybe.to!int;
+                    out_.framesFlag = maybe.to!int;
                 }
-                ++i; // skip value
+                ++i;
             }
             continue;
         }
-        positional ~= arg;
+        if (arg == "--transparent-window") {
+            out_.transparentWindow = ToggleOption.Enabled;
+            continue;
+        }
+        if (arg == "--no-transparent-window") {
+            out_.transparentWindow = ToggleOption.Disabled;
+            continue;
+        }
+        if (arg == "--transparent-window-retry") {
+            out_.transparentRetry = ToggleOption.Enabled;
+            continue;
+        }
+        if (arg == "--no-transparent-window-retry") {
+            out_.transparentRetry = ToggleOption.Disabled;
+            continue;
+        }
+        if (arg == "--transparent-debug") {
+            out_.transparentDebug = ToggleOption.Enabled;
+            continue;
+        }
+        if (arg == "--no-transparent-debug") {
+            out_.transparentDebug = ToggleOption.Disabled;
+            continue;
+        }
+        out_.positional ~= arg;
     }
+    return out_;
+}
+
+void configureTransparentWindow(SDL_Window* window) {
+    if (window is null) {
+        transparentDebug("[transparent] skipped: window is null");
+        return;
+    }
+
+    version (Windows) {
+        import bindbc.sdl.bind.sdlsyswm : SDL_SysWMinfo, SDL_GetWindowWMInfo;
+        import bindbc.sdl.bind.sdlversion : SDL_VERSION;
+        import core.sys.windows.windows : HWND, BOOL, BYTE, DWORD, LONG_PTR, HRGN, HRESULT,
+            GWL_EXSTYLE, WS_EX_LAYERED, LWA_ALPHA, GetWindowLongPtrW, SetWindowLongPtrW, SetLayeredWindowAttributes;
+
+        struct DWM_BLURBEHIND {
+            DWORD dwFlags;
+            BOOL fEnable;
+            HRGN hRgnBlur;
+            BOOL fTransitionOnMaximized;
+        }
+
+        enum DWM_BB_ENABLE = 0x00000001;
+        extern (Windows) HRESULT DwmEnableBlurBehindWindow(HWND hWnd, const DWM_BLURBEHIND* pBlurBehind);
+
+        SDL_SysWMinfo info = SDL_SysWMinfo.init;
+        SDL_VERSION(&info.version_);
+        if (SDL_GetWindowWMInfo(window, &info) == SDL_TRUE &&
+            info.subsystem == SDL_SYSWM_TYPE.SDL_SYSWM_WINDOWS) {
+            auto hwnd = cast(HWND)info.info.win.window;
+            auto exStyle = cast(LONG_PTR)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            auto nextStyle = exStyle | WS_EX_LAYERED;
+            if (nextStyle != exStyle) {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, nextStyle);
+            }
+
+            // Keep window fully visible while enabling per-pixel composition path.
+            SetLayeredWindowAttributes(hwnd, 0, cast(BYTE)255, LWA_ALPHA);
+
+            DWM_BLURBEHIND bb = DWM_BLURBEHIND.init;
+            bb.dwFlags = DWM_BB_ENABLE;
+            bb.fEnable = 1;
+            DwmEnableBlurBehindWindow(hwnd, &bb);
+            transparentDebug("[transparent] windows: applied layered + dwm blur-behind");
+        }
+    } else version (OSX) {
+        import bindbc.sdl.bind.sdlsyswm : SDL_SysWMinfo, SDL_GetWindowWMInfo;
+        import bindbc.sdl.bind.sdlversion : SDL_VERSION;
+        import core.sys.posix.dlfcn : dlopen, dlsym, RTLD_NOW, RTLD_LOCAL;
+
+        alias ObjcId = void*;
+        alias ObjcSel = void*;
+        alias ObjcBool = byte;
+        alias ObjcGetClassFn = extern(C) ObjcId function(const(char)*);
+        alias ObjcRegisterSelFn = extern(C) ObjcSel function(const(char)*);
+        alias MsgSendIdFn = extern(C) ObjcId function(ObjcId, ObjcSel);
+        alias MsgSendBoolFn = extern(C) void function(ObjcId, ObjcSel, ObjcBool);
+        alias MsgSendObjFn = extern(C) void function(ObjcId, ObjcSel, ObjcId);
+        alias MsgSendULongFn = extern(C) ulong function(ObjcId, ObjcSel);
+        alias MsgSendIndexObjFn = extern(C) ObjcId function(ObjcId, ObjcSel, ulong);
+        alias MsgSendBoolSelFn = extern(C) ObjcBool function(ObjcId, ObjcSel, ObjcSel);
+        alias MsgSendSetValuesFn = extern(C) void function(ObjcId, ObjcSel, const(int)*, int);
+
+        auto objcHandle = dlopen("/usr/lib/libobjc.A.dylib".toStringz, RTLD_NOW | RTLD_LOCAL);
+        if (objcHandle is null) {
+            transparentDebug("[transparent] macOS: failed to open /usr/lib/libobjc.A.dylib");
+            return;
+        }
+
+        auto objcGetClass = cast(ObjcGetClassFn)dlsym(objcHandle, "objc_getClass".toStringz);
+        auto selRegisterName = cast(ObjcRegisterSelFn)dlsym(objcHandle, "sel_registerName".toStringz);
+        auto objcMsgSendRaw = dlsym(objcHandle, "objc_msgSend".toStringz);
+        if (objcGetClass is null || selRegisterName is null || objcMsgSendRaw is null) {
+            transparentDebug("[transparent] macOS: objc runtime symbols not found");
+            return;
+        }
+
+        auto msgSendId = cast(MsgSendIdFn)objcMsgSendRaw;
+        auto msgSendBool = cast(MsgSendBoolFn)objcMsgSendRaw;
+        auto msgSendObj = cast(MsgSendObjFn)objcMsgSendRaw;
+        auto msgSendULong = cast(MsgSendULongFn)objcMsgSendRaw;
+        auto msgSendIndexObj = cast(MsgSendIndexObjFn)objcMsgSendRaw;
+        auto msgSendBoolSel = cast(MsgSendBoolSelFn)objcMsgSendRaw;
+        auto msgSendSetValues = cast(MsgSendSetValuesFn)objcMsgSendRaw;
+
+        SDL_SysWMinfo info = SDL_SysWMinfo.init;
+        SDL_VERSION(&info.version_);
+        if (SDL_GetWindowWMInfo(window, &info) != SDL_TRUE ||
+            info.subsystem != SDL_SYSWM_TYPE.SDL_SYSWM_COCOA) {
+            transparentDebug("[transparent] macOS: SDL_GetWindowWMInfo failed or non-COCOA subsystem=" ~ (cast(int)info.subsystem).to!string);
+            return;
+        }
+
+        auto nsWindow = cast(ObjcId)info.info.cocoa.window;
+        if (nsWindow is null) {
+            transparentDebug("[transparent] macOS: nsWindow is null");
+            return;
+        }
+
+        auto nsColorClass = objcGetClass("NSColor".toStringz);
+        if (nsColorClass is null) {
+            transparentDebug("[transparent] macOS: NSColor class not found");
+            return;
+        }
+
+        auto selClearColor = selRegisterName("clearColor".toStringz);
+        auto selCGColor = selRegisterName("CGColor".toStringz);
+        auto selContentView = selRegisterName("contentView".toStringz);
+        auto selSubviews = selRegisterName("subviews".toStringz);
+        auto selCount = selRegisterName("count".toStringz);
+        auto selObjectAtIndex = selRegisterName("objectAtIndex:".toStringz);
+        auto selLayer = selRegisterName("layer".toStringz);
+        auto selSublayers = selRegisterName("sublayers".toStringz);
+        auto selSetWantsLayer = selRegisterName("setWantsLayer:".toStringz);
+        auto selSetOpaque = selRegisterName("setOpaque:".toStringz);
+        auto selSetBackgroundColor = selRegisterName("setBackgroundColor:".toStringz);
+        auto selSetHasShadow = selRegisterName("setHasShadow:".toStringz);
+        auto selOpenGLContext = selRegisterName("openGLContext".toStringz);
+        auto selSetValuesForParameter = selRegisterName("setValues:forParameter:".toStringz);
+        auto selRespondsToSelector = selRegisterName("respondsToSelector:".toStringz);
+        if (selClearColor is null || selCGColor is null ||
+            selContentView is null || selSubviews is null || selCount is null || selObjectAtIndex is null ||
+            selLayer is null || selSublayers is null ||
+            selSetWantsLayer is null || selSetOpaque is null ||
+            selSetBackgroundColor is null || selSetHasShadow is null ||
+            selOpenGLContext is null || selSetValuesForParameter is null || selRespondsToSelector is null) {
+            transparentDebug("[transparent] macOS: selector lookup failed");
+            return;
+        }
+
+        auto clearColor = msgSendId(nsColorClass, selClearColor);
+        if (clearColor is null) {
+            transparentDebug("[transparent] macOS: [NSColor clearColor] returned null");
+            return;
+        }
+        auto clearCg = msgSendId(clearColor, selCGColor);
+
+        msgSendBool(nsWindow, selSetOpaque, cast(ObjcBool)0);
+        msgSendObj(nsWindow, selSetBackgroundColor, clearColor);
+        // Shadow darkens transparent edge pixels; disable by default.
+        msgSendBool(nsWindow, selSetHasShadow, cast(ObjcBool)0);
+
+        size_t touchedViews = 0;
+        size_t touchedLayers = 0;
+
+        void applyLayerTreeTransparency(ObjcId layer) {
+            if (layer is null) return;
+            touchedLayers++;
+            msgSendBool(layer, selSetOpaque, cast(ObjcBool)0);
+            if (clearCg !is null) {
+                msgSendObj(layer, selSetBackgroundColor, clearCg);
+            }
+            auto sublayers = msgSendId(layer, selSublayers);
+            if (sublayers is null) return;
+            auto subCount = msgSendULong(sublayers, selCount);
+            foreach (i; 0 .. subCount) {
+                auto sublayer = msgSendIndexObj(sublayers, selObjectAtIndex, cast(ulong)i);
+                applyLayerTreeTransparency(sublayer);
+            }
+        }
+
+        auto applyViewTransparency = (ObjcId view) {
+            if (view is null) return;
+            touchedViews++;
+            msgSendBool(view, selSetWantsLayer, cast(ObjcBool)1);
+            msgSendBool(view, selSetOpaque, cast(ObjcBool)0);
+            auto layer = msgSendId(view, selLayer);
+            applyLayerTreeTransparency(layer);
+        };
+
+        auto contentView = msgSendId(nsWindow, selContentView);
+        applyViewTransparency(contentView);
+        if (contentView !is null) {
+            auto subviews = msgSendId(contentView, selSubviews);
+            if (subviews !is null) {
+                auto subCount = msgSendULong(subviews, selCount);
+                foreach (i; 0 .. subCount) {
+                    auto subview = msgSendIndexObj(subviews, selObjectAtIndex, cast(ulong)i);
+                    applyViewTransparency(subview);
+                }
+            }
+        }
+
+        // OpenGL path only: request non-opaque context surface explicitly when available.
+        version (EnableVulkanBackend) {
+        } else {
+            if (contentView !is null) {
+                auto hasOpenGLContext = msgSendBoolSel(contentView, selRespondsToSelector, selOpenGLContext);
+                if (hasOpenGLContext != 0) {
+                    auto glctx = msgSendId(contentView, selOpenGLContext);
+                    if (glctx !is null) {
+                        enum NSOpenGLCPSurfaceOpacity = 236;
+                        int zero = 0;
+                        msgSendSetValues(glctx, selSetValuesForParameter, &zero, NSOpenGLCPSurfaceOpacity);
+                    }
+                }
+            }
+        }
+
+        transparentDebug("[transparent] macOS: applied non-opaque settings views=" ~ touchedViews.to!string ~ " layers=" ~ touchedLayers.to!string);
+    } else version (linux) {
+        import bindbc.sdl.bind.sdlsyswm : SDL_SysWMinfo, SDL_GetWindowWMInfo;
+        import bindbc.sdl.bind.sdlversion : SDL_VERSION;
+        import core.stdc.stdint : uint32_t;
+        import core.sys.posix.dlfcn : dlopen, dlsym, RTLD_NOW, RTLD_LOCAL;
+
+        alias XDisplay = void;
+        alias XWindow = ulong;
+        alias XAtom = ulong;
+        alias XBool = int;
+
+        alias XInternAtomFn = XAtom function(XDisplay* display, const(char)* atom_name, XBool only_if_exists);
+        alias XChangePropertyFn = int function(XDisplay* display,
+                                               XWindow w,
+                                               XAtom property,
+                                               XAtom type,
+                                               int format,
+                                               int mode,
+                                               const(ubyte)* data,
+                                               int nelements);
+        alias XFlushFn = int function(XDisplay* display);
+
+        enum PropModeReplace = 0;
+
+        SDL_SysWMinfo info = SDL_SysWMinfo.init;
+        SDL_VERSION(&info.version_);
+        if (SDL_GetWindowWMInfo(window, &info) != SDL_TRUE ||
+            info.subsystem != SDL_SYSWM_TYPE.SDL_SYSWM_X11) {
+            return;
+        }
+
+        auto x11 = dlopen("libX11.so.6".toStringz, RTLD_NOW | RTLD_LOCAL);
+        if (x11 is null) return;
+
+        auto xInternAtom = cast(XInternAtomFn)dlsym(x11, "XInternAtom".toStringz);
+        auto xChangeProperty = cast(XChangePropertyFn)dlsym(x11, "XChangeProperty".toStringz);
+        auto xFlush = cast(XFlushFn)dlsym(x11, "XFlush".toStringz);
+        if (xInternAtom is null || xChangeProperty is null || xFlush is null) return;
+
+        auto display = cast(XDisplay*)info.info.x11.display;
+        auto xwindow = cast(XWindow)info.info.x11.window;
+        if (display is null || xwindow == 0) return;
+
+        auto atomCardinal = xInternAtom(display, "CARDINAL".toStringz, 0);
+        if (atomCardinal == 0) return;
+
+        // Explicitly keep compositor path enabled so alpha visuals are respected.
+        auto atomBypass = xInternAtom(display, "_NET_WM_BYPASS_COMPOSITOR".toStringz, 0);
+        if (atomBypass != 0) {
+            uint32_t bypass = 0;
+            xChangeProperty(display,
+                            xwindow,
+                            atomBypass,
+                            atomCardinal,
+                            32,
+                            PropModeReplace,
+                            cast(const(ubyte)*)&bypass,
+                            1);
+        }
+
+        // Keep whole-window opacity at 1.0; per-pixel alpha still comes from rendering.
+        auto atomOpacity = xInternAtom(display, "_NET_WM_WINDOW_OPACITY".toStringz, 0);
+        if (atomOpacity != 0) {
+            uint32_t opacity = uint32_t.max;
+            xChangeProperty(display,
+                            xwindow,
+                            atomOpacity,
+                            atomCardinal,
+                            32,
+                            PropModeReplace,
+                            cast(const(ubyte)*)&opacity,
+                            1);
+        }
+
+        xFlush(display);
+        transparentDebug("[transparent] linux-x11: applied compositor/opacity window properties");
+    }
+}
+
+void main(string[] args) {
+    auto cli = parseCliOptions(args);
+    bool isTest = cli.isTest;
+    string[] positional = cli.positional;
+    int framesFlag = cli.framesFlag;
+    import core.stdc.stdlib : getenv;
+    import std.string : fromStringz;
+    import std.conv : to;
+    // Defaults for test mode
+    int testMaxFrames = 5;
+    auto testTimeout = 5.seconds;
     if (positional.length < 1) {
-        writeln("Usage: nijiv <puppet.inp|puppet.inx> [width height] [--test]");
+        writeln("Usage: nijiv <puppet.inp|puppet.inx> [width height] [--test] [--transparent-window|--no-transparent-window] [--transparent-window-retry|--no-transparent-window-retry] [--transparent-debug]");
         return;
     }
     string puppetPath = resolvePuppetPath(positional[0]);
@@ -239,9 +599,13 @@ void main(string[] args) {
         import core.time : msecs;
         try testTimeout = msecs(to!int(fromStringz(p))); catch (Exception) {}
     }
+    gTransparentDebugLog = resolveToggle(cli.transparentDebug, "NJIV_TRANSPARENT_DEBUG", false);
+    bool transparentWindowEnabled = resolveToggle(cli.transparentWindow, "NJIV_TRANSPARENT_WINDOW", true);
+    bool transparentWindowRetry = resolveToggle(cli.transparentRetry, "NJIV_TRANSPARENT_WINDOW_RETRY", true);
 
     writefln("nijiv (%s DLL) start: file=%s, size=%sx%s (test=%s frames=%s timeout=%s)",
         backendName, puppetPath, width, height, isTest, testMaxFrames, testTimeout);
+    transparentDebug("[transparent] option enabled=" ~ transparentWindowEnabled.to!string ~ " retry=" ~ transparentWindowRetry.to!string);
 
     BackendInit backendInit = void;
     version (EnableVulkanBackend) {
@@ -269,6 +633,11 @@ void main(string[] args) {
         }
         SDL_GL_GetDrawableSize(backendInit.window, &backendInit.drawableW, &backendInit.drawableH);
     }
+
+    if (transparentWindowEnabled) {
+        configureTransparentWindow(backendInit.window);
+    }
+    bool transparencyRetryPending = transparentWindowEnabled && transparentWindowRetry;
 
     // Load the Unity-facing DLL from a nearby nijilive build.
     string exeDir = getcwd();
@@ -361,6 +730,11 @@ void main(string[] args) {
                             frameCfg.viewportHeight = backendInit.drawableH;
                             currentRenderBackend().setViewport(backendInit.drawableW, backendInit.drawableH);
                         }
+                        if (transparentWindowEnabled) {
+                            // SDL may recreate native view/layer objects on resize.
+                            // Re-apply transparency settings to keep alpha compositing active.
+                            configureTransparentWindow(backendInit.window);
+                        }
                     }
                     break;
                 case SDL_MOUSEWHEEL:
@@ -399,6 +773,13 @@ void main(string[] args) {
         enforce(api.getSharedBuffers(renderer, &snapshot) == gfx.NjgResult.Ok, "njgGetSharedBuffers failed");
 
         gfx.renderCommands(&backendInit, &snapshot, &view);
+
+        // Some SDL backends create/replace native subviews lazily after first render.
+        // Re-apply transparency once to catch late-created view/layer objects.
+        if (transparencyRetryPending) {
+            configureTransparentWindow(backendInit.window);
+            transparencyRetryPending = false;
+        }
 
         if (isEnvEnabled("NJIV_SKIP_FLUSH")) {
         } else {
