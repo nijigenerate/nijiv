@@ -12,6 +12,26 @@ import std.algorithm : clamp;
 
 version (Windows) {
     import core.sys.windows.windows : HMODULE, GetLastError, GetProcAddress;
+    import core.sys.windows.windows : HWND, BOOL, DWORD, LONG, HRGN, HRESULT;
+    pragma(lib, "dwmapi");
+
+    struct DWM_BLURBEHIND {
+        DWORD dwFlags;
+        BOOL fEnable;
+        HRGN hRgnBlur;
+        BOOL fTransitionOnMaximized;
+    }
+
+    struct MARGINS {
+        LONG cxLeftWidth;
+        LONG cxRightWidth;
+        LONG cyTopHeight;
+        LONG cyBottomHeight;
+    }
+
+    enum DWM_BB_ENABLE = 0x00000001;
+    extern (Windows) HRESULT DwmExtendFrameIntoClientArea(HWND hWnd, const(MARGINS)* pMarInset);
+    extern (Windows) HRESULT DwmEnableBlurBehindWindow(HWND hWnd, const(DWM_BLURBEHIND)* pBlurBehind);
 } else version (Posix) {
     import core.sys.posix.dlfcn : dlsym, dlerror;
 }
@@ -29,7 +49,7 @@ version (EnableVulkanBackend) {
 } else {
     import bindbc.opengl;
     import gfx = opengl.opengl_backend;
-    import opengl.opengl_backend : currentRenderBackend;
+    import opengl.opengl_backend : currentRenderBackend, inClearColor;
     enum backendName = "opengl";
     alias BackendInit = gfx.OpenGLBackendInit;
 }
@@ -212,6 +232,18 @@ private void transparentDebug(string message) {
     stderr.flush();
 }
 
+version (Windows) {
+    private enum WindowsTransparencyMode {
+        ColorKey,
+        Dwm,
+    }
+
+    private WindowsTransparencyMode windowsTransparencyMode() {
+        // Force colorkey mode on Windows; DWM paths caused semi-transparent results on tested setups.
+        return WindowsTransparencyMode.ColorKey;
+    }
+}
+
 private bool tryParseEnvBool(string name, out bool value) {
     import core.stdc.stdlib : getenv;
     auto p = getenv(name.toStringz);
@@ -302,17 +334,11 @@ void configureTransparentWindow(SDL_Window* window) {
         import bindbc.sdl.bind.sdlsyswm : SDL_SysWMinfo, SDL_GetWindowWMInfo;
         import bindbc.sdl.bind.sdlversion : SDL_VERSION;
         import core.sys.windows.windows : HWND, BOOL, BYTE, DWORD, LONG_PTR, HRGN, HRESULT,
-            GWL_EXSTYLE, WS_EX_LAYERED, LWA_ALPHA, GetWindowLongPtrW, SetWindowLongPtrW, SetLayeredWindowAttributes;
-
-        struct DWM_BLURBEHIND {
-            DWORD dwFlags;
-            BOOL fEnable;
-            HRGN hRgnBlur;
-            BOOL fTransitionOnMaximized;
-        }
-
-        enum DWM_BB_ENABLE = 0x00000001;
-        extern (Windows) HRESULT DwmEnableBlurBehindWindow(HWND hWnd, const DWM_BLURBEHIND* pBlurBehind);
+            GWL_EXSTYLE, WS_EX_LAYERED, LWA_ALPHA, LWA_COLORKEY,
+            GetWindowLongPtrW, SetWindowLongPtrW, SetLayeredWindowAttributes;
+        auto mode = windowsTransparencyMode();
+        bool useDwmBlurBehind = (mode == WindowsTransparencyMode.Dwm) &&
+            resolveToggle(ToggleOption.Unspecified, "NJIV_WINDOWS_BLUR_BEHIND", true);
 
         SDL_SysWMinfo info = SDL_SysWMinfo.init;
         SDL_VERSION(&info.version_);
@@ -325,14 +351,33 @@ void configureTransparentWindow(SDL_Window* window) {
                 SetWindowLongPtrW(hwnd, GWL_EXSTYLE, nextStyle);
             }
 
-            // Keep window fully visible while enabling per-pixel composition path.
-            SetLayeredWindowAttributes(hwnd, 0, cast(BYTE)255, LWA_ALPHA);
+            if (mode == WindowsTransparencyMode.ColorKey) {
+                // RGB(1, 0, 1) becomes fully transparent. Renderer clears background to this key color.
+                DWORD colorKey = (cast(DWORD)1 << 16) | cast(DWORD)1;
+                SetLayeredWindowAttributes(hwnd, colorKey, cast(BYTE)255, LWA_COLORKEY);
+                SDL_SetWindowBordered(window, SDL_FALSE);
+                transparentDebug("[transparent] windows: applied layered colorkey mode");
+            } else {
+                // Keep window fully visible while enabling per-pixel composition path.
+                SetLayeredWindowAttributes(hwnd, 0, cast(BYTE)255, LWA_ALPHA);
+                // Extend frame over the whole client area so alpha in the backbuffer can be composed.
+                MARGINS margins = MARGINS.init;
+                margins.cxLeftWidth = -1;
+                margins.cxRightWidth = -1;
+                margins.cyTopHeight = -1;
+                margins.cyBottomHeight = -1;
+                DwmExtendFrameIntoClientArea(hwnd, &margins);
+            }
 
-            DWM_BLURBEHIND bb = DWM_BLURBEHIND.init;
-            bb.dwFlags = DWM_BB_ENABLE;
-            bb.fEnable = 1;
-            DwmEnableBlurBehindWindow(hwnd, &bb);
-            transparentDebug("[transparent] windows: applied layered + dwm blur-behind");
+            if (mode == WindowsTransparencyMode.Dwm && useDwmBlurBehind) {
+                DWM_BLURBEHIND bb = DWM_BLURBEHIND.init;
+                bb.dwFlags = DWM_BB_ENABLE;
+                bb.fEnable = 1;
+                DwmEnableBlurBehindWindow(hwnd, &bb);
+                transparentDebug("[transparent] windows: applied layered + dwm blur-behind");
+            } else if (mode == WindowsTransparencyMode.Dwm) {
+                transparentDebug("[transparent] windows: applied layered alpha-only (no DWM blur)");
+            }
         }
     } else version (OSX) {
         import bindbc.sdl.bind.sdlsyswm : SDL_SysWMinfo, SDL_GetWindowWMInfo;
@@ -602,9 +647,23 @@ void main(string[] args) {
     gTransparentDebugLog = resolveToggle(cli.transparentDebug, "NJIV_TRANSPARENT_DEBUG", false);
     bool transparentWindowEnabled = resolveToggle(cli.transparentWindow, "NJIV_TRANSPARENT_WINDOW", true);
     bool transparentWindowRetry = resolveToggle(cli.transparentRetry, "NJIV_TRANSPARENT_WINDOW_RETRY", true);
+    version (Windows) {
+        version (EnableVulkanBackend) {
+        } else version (EnableDirectXBackend) {
+        } else {
+            if (windowsTransparencyMode() == WindowsTransparencyMode.ColorKey) {
+                // Match Windows colorkey (RGB 1,0,1) so background pixels become fully transparent.
+                inClearColor = typeof(inClearColor)(1.0f / 255.0f, 0.0f, 1.0f / 255.0f, 1.0f);
+            }
+        }
+    }
 
     writefln("nijiv (%s DLL) start: file=%s, size=%sx%s (test=%s frames=%s timeout=%s)",
         backendName, puppetPath, width, height, isTest, testMaxFrames, testTimeout);
+    version (Windows) {
+        auto mode = windowsTransparencyMode();
+        writefln("Windows transparency mode: %s", mode == WindowsTransparencyMode.ColorKey ? "colorkey" : "dwm");
+    }
     transparentDebug("[transparent] option enabled=" ~ transparentWindowEnabled.to!string ~ " retry=" ~ transparentWindowRetry.to!string);
 
     BackendInit backendInit = void;
@@ -696,6 +755,28 @@ void main(string[] args) {
         }
     }
 
+    bool autoWheel = isEnvEnabled("NJIV_AUTO_WHEEL");
+    int autoWheelInterval = 3;
+    if (auto p = getenv("NJIV_AUTO_WHEEL_INTERVAL")) {
+        try {
+            autoWheelInterval = to!int(fromStringz(p));
+        } catch (Exception) {}
+    }
+    if (autoWheelInterval <= 0) autoWheelInterval = 3;
+    int autoWheelPhaseTicks = 18;
+    if (auto p = getenv("NJIV_AUTO_WHEEL_PHASE_TICKS")) {
+        try {
+            autoWheelPhaseTicks = to!int(fromStringz(p));
+        } catch (Exception) {}
+    }
+    if (autoWheelPhaseTicks <= 0) autoWheelPhaseTicks = 18;
+    int autoWheelY = 1;
+    int autoWheelPhaseCount = 0;
+    if (autoWheel) {
+        writefln("Auto wheel enabled: interval=%s phaseTicks=%s startY=%s",
+            autoWheelInterval, autoWheelPhaseTicks, autoWheelY);
+    }
+
     bool running = true;
     int frameCount = 0;
     MonoTime startTime = MonoTime.currTime;
@@ -757,6 +838,23 @@ void main(string[] args) {
         }
         if (!running) {
             break;
+        }
+
+        if (autoWheel && api.setPuppetScale !is null && frameCount > 0 &&
+            (frameCount % autoWheelInterval) == 0) {
+            int wheelY = autoWheelY;
+            autoWheelPhaseCount++;
+            if (autoWheelPhaseCount >= autoWheelPhaseTicks) {
+                autoWheelPhaseCount = 0;
+                autoWheelY = -autoWheelY;
+            }
+            // Match SDL_MOUSEWHEEL handling path exactly.
+            float step = 0.1f;
+            float factor = cast(float)exp(step * -wheelY);
+            puppetScale = clamp(puppetScale * factor, 0.1f, 10.0f);
+            auto res = api.setPuppetScale(puppet, puppetScale, puppetScale);
+            writefln("Auto wheel frame=%s -> wheelY=%s scale=%s res=%s",
+                frameCount, wheelY, puppetScale, res);
         }
 
         MonoTime now = MonoTime.currTime;

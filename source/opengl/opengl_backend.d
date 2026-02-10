@@ -13,7 +13,9 @@ import opengl.opengl_thumb : currentDebugTextureBackend;
 import bindbc.opengl.context;
 
 import std.algorithm : min;
-import core.sys.posix.dlfcn : dlopen, dlsym, RTLD_NOW, RTLD_LOCAL;
+version (OSX) {
+    import core.sys.posix.dlfcn : dlopen, dlsym, RTLD_NOW, RTLD_LOCAL;
+}
 
 import std.algorithm.comparison : max;
 import std.algorithm.mutation : swap;
