@@ -1364,6 +1364,9 @@ float4 psMain(VSOutput input) : SV_TARGET {
     float4 c0 = sampleTex(gTex0, uv, flipTex0);
     float4 c1 = sampleTex(gTex1, uv, flipTex1);
     float4 c2 = sampleTex(gTex2, uv, flipTex2);
+    if (c0.a <= 0.0001) {
+        discard;
+    }
     if (isMask > 0.5) {
         if (c0.a <= maskThreshold) discard;
         return float4(1, 1, 1, 1);
@@ -2718,6 +2721,8 @@ public:
 
         auto mvp = mulMat4(packet.renderMatrix, packet.modelMatrix);
         auto baseVertex = cast(uint)cpuVertices.length;
+        if (baseVertex > ushort.max) return;
+        if (packet.vertexCount - 1 > cast(size_t)(ushort.max - baseVertex)) return;
         cpuVertices.reserve(cpuVertices.length + packet.vertexCount);
         foreach (i; 0 .. packet.vertexCount) {
             auto px = vertices.data[vxBase + i] + deform.data[dxBase + i] - packet.origin.x;
@@ -2736,14 +2741,24 @@ public:
 
         cpuIndices.reserve(cpuIndices.length + packet.indexCount);
         auto firstIndex = cast(uint)cpuIndices.length;
-        foreach (i; 0 .. packet.indexCount) {
-            auto idx = packet.indices[i];
-            if (idx < packet.vertexCount) {
-                uint vi = baseVertex + idx;
-                if (vi <= ushort.max) {
-                    cpuIndices ~= cast(ushort)vi;
-                }
+        auto triCount = packet.indexCount / 3;
+        size_t droppedTriangles = 0;
+        foreach (t; 0 .. triCount) {
+            auto i0 = packet.indices[t * 3 + 0];
+            auto i1 = packet.indices[t * 3 + 1];
+            auto i2 = packet.indices[t * 3 + 2];
+            if (i0 >= packet.vertexCount || i1 >= packet.vertexCount || i2 >= packet.vertexCount) {
+                droppedTriangles++;
+                continue;
             }
+            cpuIndices ~= cast(ushort)(baseVertex + i0);
+            cpuIndices ~= cast(ushort)(baseVertex + i1);
+            cpuIndices ~= cast(ushort)(baseVertex + i2);
+        }
+        if (droppedTriangles > 0 && isDxTraceEnabled()) {
+            dxTrace("drawPartPacket.droppedTriangles=" ~ to!string(droppedTriangles) ~
+                " indexCount=" ~ to!string(packet.indexCount) ~
+                " vertexCount=" ~ to!string(packet.vertexCount));
         }
         auto appended = cast(uint)cpuIndices.length - firstIndex;
         if (appended > 0) {
@@ -2818,6 +2833,8 @@ public:
 
         auto mvp = packet.mvp;
         auto baseVertex = cast(uint)cpuVertices.length;
+        if (baseVertex > ushort.max) return;
+        if (packet.vertexCount - 1 > cast(size_t)(ushort.max - baseVertex)) return;
         cpuVertices.reserve(cpuVertices.length + packet.vertexCount);
         foreach (i; 0 .. packet.vertexCount) {
             auto px = vertices.data[vxBase + i] + deform.data[dxBase + i] - packet.origin.x;
@@ -2836,14 +2853,24 @@ public:
 
         auto firstIndex = cast(uint)cpuIndices.length;
         cpuIndices.reserve(cpuIndices.length + packet.indexCount);
-        foreach (i; 0 .. packet.indexCount) {
-            auto idx = packet.indices[i];
-            if (idx < packet.vertexCount) {
-                uint vi = baseVertex + idx;
-                if (vi <= ushort.max) {
-                    cpuIndices ~= cast(ushort)vi;
-                }
+        auto triCount = packet.indexCount / 3;
+        size_t droppedTriangles = 0;
+        foreach (t; 0 .. triCount) {
+            auto i0 = packet.indices[t * 3 + 0];
+            auto i1 = packet.indices[t * 3 + 1];
+            auto i2 = packet.indices[t * 3 + 2];
+            if (i0 >= packet.vertexCount || i1 >= packet.vertexCount || i2 >= packet.vertexCount) {
+                droppedTriangles++;
+                continue;
             }
+            cpuIndices ~= cast(ushort)(baseVertex + i0);
+            cpuIndices ~= cast(ushort)(baseVertex + i1);
+            cpuIndices ~= cast(ushort)(baseVertex + i2);
+        }
+        if (droppedTriangles > 0 && isDxTraceEnabled()) {
+            dxTrace("drawMaskPacket.droppedTriangles=" ~ to!string(droppedTriangles) ~
+                " indexCount=" ~ to!string(packet.indexCount) ~
+                " vertexCount=" ~ to!string(packet.vertexCount));
         }
 
         auto appended = cast(uint)cpuIndices.length - firstIndex;
