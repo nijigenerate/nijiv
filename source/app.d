@@ -239,8 +239,12 @@ version (Windows) {
     }
 
     private WindowsTransparencyMode windowsTransparencyMode() {
-        // Force colorkey mode on Windows; DWM paths caused semi-transparent results on tested setups.
-        return WindowsTransparencyMode.ColorKey;
+        version (EnableVulkanBackend) {
+            // Vulkan + layered colorkey is unstable on Windows (often stays visible as magenta/black).
+            return WindowsTransparencyMode.Dwm;
+        } else {
+            return WindowsTransparencyMode.ColorKey;
+        }
     }
 }
 
@@ -337,30 +341,37 @@ void configureTransparentWindow(SDL_Window* window) {
             GWL_EXSTYLE, WS_EX_LAYERED, LWA_ALPHA, LWA_COLORKEY,
             GetWindowLongPtrW, SetWindowLongPtrW, SetLayeredWindowAttributes;
         auto mode = windowsTransparencyMode();
+        bool defaultDwmBlurBehind = false;
+        version (EnableVulkanBackend) {
+            defaultDwmBlurBehind = true;
+        }
         bool useDwmBlurBehind = (mode == WindowsTransparencyMode.Dwm) &&
-            resolveToggle(ToggleOption.Unspecified, "NJIV_WINDOWS_BLUR_BEHIND", true);
+            resolveToggle(ToggleOption.Unspecified, "NJIV_WINDOWS_BLUR_BEHIND", defaultDwmBlurBehind);
 
         SDL_SysWMinfo info = SDL_SysWMinfo.init;
         SDL_VERSION(&info.version_);
         if (SDL_GetWindowWMInfo(window, &info) == SDL_TRUE &&
             info.subsystem == SDL_SYSWM_TYPE.SDL_SYSWM_WINDOWS) {
             auto hwnd = cast(HWND)info.info.win.window;
-            auto exStyle = cast(LONG_PTR)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            auto nextStyle = exStyle | WS_EX_LAYERED;
-            if (nextStyle != exStyle) {
-                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, nextStyle);
-            }
-
             if (mode == WindowsTransparencyMode.ColorKey) {
-                // RGB(1, 0, 1) becomes fully transparent. Renderer clears background to this key color.
-                DWORD colorKey = (cast(DWORD)1 << 16) | cast(DWORD)1;
+                auto exStyle = cast(LONG_PTR)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                auto nextStyle = exStyle | WS_EX_LAYERED;
+                if (nextStyle != exStyle) {
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, nextStyle);
+                }
+                // RGB(255, 0, 255) becomes fully transparent. Use full-intensity key to avoid
+                // colorspace/quantization mismatches (notably Vulkan + sRGB swapchains).
+                DWORD colorKey = (cast(DWORD)255 << 16) | cast(DWORD)255;
                 SetLayeredWindowAttributes(hwnd, colorKey, cast(BYTE)255, LWA_COLORKEY);
-                SDL_SetWindowBordered(window, SDL_FALSE);
                 transparentDebug("[transparent] windows: applied layered colorkey mode");
             } else {
-                // Keep window fully visible while enabling per-pixel composition path.
-                SetLayeredWindowAttributes(hwnd, 0, cast(BYTE)255, LWA_ALPHA);
-                // Extend frame over the whole client area so alpha in the backbuffer can be composed.
+                // DWM mode: avoid layered colorkey path, let compositor use swapchain alpha.
+                auto exStyle = cast(LONG_PTR)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                auto nextStyle = exStyle & ~cast(LONG_PTR)WS_EX_LAYERED;
+                if (nextStyle != exStyle) {
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, nextStyle);
+                }
+                // Extend frame over the whole client area so backbuffer alpha can be composed.
                 MARGINS margins = MARGINS.init;
                 margins.cxLeftWidth = -1;
                 margins.cxRightWidth = -1;
@@ -648,12 +659,18 @@ void main(string[] args) {
     bool transparentWindowEnabled = resolveToggle(cli.transparentWindow, "NJIV_TRANSPARENT_WINDOW", true);
     bool transparentWindowRetry = resolveToggle(cli.transparentRetry, "NJIV_TRANSPARENT_WINDOW_RETRY", true);
     version (Windows) {
-        version (EnableVulkanBackend) {
-        } else version (EnableDirectXBackend) {
+        version (EnableDirectXBackend) {
         } else {
             if (windowsTransparencyMode() == WindowsTransparencyMode.ColorKey) {
-                // Match Windows colorkey (RGB 1,0,1) so background pixels become fully transparent.
-                inClearColor = typeof(inClearColor)(1.0f / 255.0f, 0.0f, 1.0f / 255.0f, 1.0f);
+                // Match Windows colorkey (RGB 255,0,255) so background pixels become fully transparent.
+                version (EnableVulkanBackend) {
+                    gfx.inClearColor = typeof(gfx.inClearColor)(1.0f, 0.0f, 1.0f, 1.0f);
+                } else {
+                    inClearColor = typeof(inClearColor)(1.0f, 0.0f, 1.0f, 1.0f);
+                }
+            } else version (EnableVulkanBackend) {
+                // DWM composition path expects transparent background in swapchain.
+                gfx.inClearColor = typeof(gfx.inClearColor)(0.0f, 0.0f, 0.0f, 0.0f);
             }
         }
     }
@@ -693,10 +710,19 @@ void main(string[] args) {
         SDL_GL_GetDrawableSize(backendInit.window, &backendInit.drawableW, &backendInit.drawableH);
     }
 
-    if (transparentWindowEnabled) {
+    bool canApplyTransparentWindow = transparentWindowEnabled;
+    version (Windows) {
+        version (EnableVulkanBackend) {
+            if (transparentWindowEnabled && !backendInit.backend.supportsPerPixelTransparency()) {
+                writeln("[transparent] windows+vulkan: swapchain composite alpha is OPAQUE; skip transparent window setup.");
+                canApplyTransparentWindow = false;
+            }
+        }
+    }
+    if (canApplyTransparentWindow) {
         configureTransparentWindow(backendInit.window);
     }
-    bool transparencyRetryPending = transparentWindowEnabled && transparentWindowRetry;
+    bool transparencyRetryPending = canApplyTransparentWindow && transparentWindowRetry;
 
     // Load the Unity-facing DLL from a nearby nijilive build.
     string exeDir = getcwd();
@@ -811,7 +837,7 @@ void main(string[] args) {
                             frameCfg.viewportHeight = backendInit.drawableH;
                             currentRenderBackend().setViewport(backendInit.drawableW, backendInit.drawableH);
                         }
-                        if (transparentWindowEnabled) {
+                        if (canApplyTransparentWindow) {
                             // SDL may recreate native view/layer objects on resize.
                             // Re-apply transparency settings to keep alpha compositing active.
                             configureTransparentWindow(backendInit.window);

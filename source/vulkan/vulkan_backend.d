@@ -44,6 +44,8 @@ struct Vec4f {
     float a;
 }
 
+public __gshared Vec4f inClearColor = Vec4f(0.0f, 0.0f, 0.0f, 0.0f);
+
 enum MaskDrawableKind : uint {
     Part,
     Mask,
@@ -244,6 +246,7 @@ struct DrawBatch {
     bool clearStencil;
     uint32_t clearStencilValue;
     uint32_t stencilReference;
+    uint32_t dynamicDepth;
 }
 
 class Texture {
@@ -293,11 +296,20 @@ public:
     ulong revision() const {
         return version_;
     }
+
+    void updateMeta(int width, int height, int inChannels = -1) {
+        this.width = width;
+        this.height = height;
+        if (inChannels > 0) channels = inChannels;
+        version_++;
+    }
 }
 
 private __gshared Texture[size_t] gTextures;
 private __gshared size_t gNextHandle = 1;
 private __gshared Object gTexturesGuard;
+private __gshared size_t[] gPendingReleaseHandles;
+private __gshared ulong gDiagTextureEventSeq;
 
 shared static this() {
     gTexturesGuard = new Object();
@@ -310,6 +322,19 @@ private void ensureDThreadAttached() {
     thread_attachThis();
 }
 
+private void flushPendingTextureReleases() {
+    if (gPendingReleaseHandles.length == 0) return;
+    synchronized (gTexturesGuard) {
+        foreach (h; gPendingReleaseHandles) {
+            if (auto tex = h in gTextures) {
+                if (*tex !is null) (*tex).dispose();
+                gTextures.remove(h);
+            }
+        }
+        gPendingReleaseHandles.length = 0;
+    }
+}
+
 private string sdlError() {
     auto err = SDL_GetError();
     return err is null ? "" : fromStringz(err).idup;
@@ -317,6 +342,16 @@ private string sdlError() {
 
 private void vkEnforce(VkResult result, string message) {
     enforce(result == VK_SUCCESS, message ~ " (VkResult=" ~ result.to!string ~ ")");
+}
+
+private string compositeAlphaName(VkCompositeAlphaFlagBitsKHR mode) {
+    switch (mode) {
+        case VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR: return "OPAQUE";
+        case VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR: return "PRE_MULTIPLIED";
+        case VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR: return "POST_MULTIPLIED";
+        case VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR: return "INHERIT";
+        default: return "UNKNOWN";
+    }
 }
 
 private VkCompositeAlphaFlagBitsKHR chooseCompositeAlpha(VkCompositeAlphaFlagsKHR supported) {
@@ -337,6 +372,14 @@ private VkCompositeAlphaFlagBitsKHR chooseCompositeAlpha(VkCompositeAlphaFlagsKH
 private bool envEnabled(string name) {
     auto value = environment.get(name, "");
     return value == "1" || value == "true" || value == "TRUE";
+}
+
+private bool diagEnabled() {
+    return envEnabled("NJIV_VK_DIAG");
+}
+
+private void diagStderr(string msg) {
+    fprintf(stderr, "[vulkan-diag] %.*s\n", cast(int)msg.length, msg.ptr);
 }
 
 private extern(System) nothrow @nogc VkBool32 vulkanValidationCallback(
@@ -503,6 +546,13 @@ private:
     uint32_t pendingMaskStencilClearValue = 1;
     uint32_t pendingMaskWriteReference = 1;
     bool advancedBlendSupported;
+    bool conservativeSync;
+    bool perPixelTransparencyAvailable;
+    uint32_t physicalVendorId;
+    string physicalDeviceName;
+    uint64_t diagFrame;
+    uint32_t diagBeginDynZeroTarget;
+    uint32_t diagDroppedDynToRoot;
     VkTextureResource[size_t] textureResources;
     VkTextureResource fallbackWhite;
     VkTextureResource fallbackBlack;
@@ -571,10 +621,15 @@ public:
         createInstance();
         createSurface();
         pickPhysicalDevice();
+        configureSyncMode();
         createLogicalDevice();
         createCommandPool();
         createSyncObjects();
         recreateSwapchain();
+    }
+
+    bool supportsPerPixelTransparency() const {
+        return perPixelTransparencyAvailable;
     }
 
     void setViewport(int width, int height) {
@@ -638,6 +693,8 @@ public:
         pendingMaskStencilClear = false;
         pendingMaskStencilClearValue = 1;
         pendingMaskWriteReference = 1;
+        diagBeginDynZeroTarget = 0;
+        diagDroppedDynToRoot = 0;
     }
 
     void postProcessScene() {
@@ -646,6 +703,13 @@ public:
 
     void endScene() {
         drawFrame();
+        if (diagEnabled()) {
+            diagStderr("frame=" ~ diagFrame.to!string ~
+                " beginDynZeroTarget=" ~ diagBeginDynZeroTarget.to!string ~
+                " droppedDynToRoot=" ~ diagDroppedDynToRoot.to!string ~
+                " batches=" ~ batches.length.to!string);
+            diagFrame++;
+        }
     }
 
     void beginMask(bool useStencil) {
@@ -662,6 +726,11 @@ public:
         maskStencilWritten = false;
         pendingMaskStencilClear = true;
         pendingMaskStencilClearValue = useStencil ? 0 : 1;
+        // Never allow dynamic-composite scoped work to clear root stencil.
+        if (dynamicCompositeStack.length > 0 && activeTargetCount == 0) {
+            pendingMaskStencilClear = false;
+            return;
+        }
         // Ensure stencil is cleared even if no mask geometry is emitted.
         DrawBatch clearOnly;
         clearOnly.targetHandle = (activeTargetCount > 0) ? activeTargetHandles[0] : 0;
@@ -714,6 +783,13 @@ public:
         activeTargetCount = min(pass.textureCount, pass.textures.length);
         foreach (i; 0 .. activeTargetCount) {
             activeTargetHandles[i] = pass.textures[i];
+        }
+        if (activeTargetCount == 0 || activeTargetHandles[0] == 0) {
+            diagBeginDynZeroTarget++;
+            if (diagEnabled()) {
+                diagStderr("beginDynamicComposite(empty-target) texCount=" ~ pass.textureCount.to!string ~
+                    " t0=" ~ pass.textures[0].to!string);
+            }
         }
         clearActiveTarget = true;
     }
@@ -807,9 +883,15 @@ public:
             }
 
             auto pushToTarget = (DrawBatch b, size_t targetHandle) {
+                if (targetHandle == 0 && dynamicCompositeStack.length > 0) {
+                    // Dynamic-composite scopes must never leak draws to root.
+                    diagDroppedDynToRoot++;
+                    return;
+                }
                 b.targetHandle = targetHandle;
                 b.clearTarget = clearActiveTarget;
                 clearActiveTarget = false;
+                b.dynamicDepth = cast(uint32_t)(dynamicCompositeStack.length / 4);
                 batches ~= b;
             };
 
@@ -905,8 +987,12 @@ public:
             b.pushConstants.tintOpacity = [1, 1, 1, 1];
             b.pushConstants.screenEmission = [0, 0, 0, 1];
             b.targetHandle = (activeTargetCount > 0) ? activeTargetHandles[0] : 0;
+            if (b.targetHandle == 0 && dynamicCompositeStack.length > 0) {
+                return;
+            }
             b.clearTarget = clearActiveTarget;
             clearActiveTarget = false;
+            b.dynamicDepth = cast(uint32_t)(dynamicCompositeStack.length / 4);
             batches ~= b;
         }
     }
@@ -1056,14 +1142,38 @@ private:
             }
 
             if (g != uint.max && p != uint.max) {
+                VkPhysicalDeviceProperties props;
+                vkGetPhysicalDeviceProperties(dev, &props);
                 physicalDevice = dev;
                 graphicsQueueFamily = g;
                 presentQueueFamily = p;
+                physicalVendorId = props.vendorID;
+                physicalDeviceName = fromStringz(props.deviceName.ptr).idup;
                 break;
             }
         }
 
         enforce(physicalDevice != VK_NULL_HANDLE, "No Vulkan device with graphics+present queue found");
+    }
+
+    void configureSyncMode() {
+        bool force = envEnabled("NJIV_VK_CONSERVATIVE_SYNC");
+        bool disable = envEnabled("NJIV_VK_DISABLE_CONSERVATIVE_SYNC");
+        bool autoEnable = false;
+        version (Windows) {
+            // NVIDIA vendor id.
+            autoEnable = (physicalVendorId == 0x10DE);
+        }
+        if (force) {
+            conservativeSync = true;
+        } else if (disable) {
+            conservativeSync = false;
+        } else {
+            conservativeSync = autoEnable;
+        }
+        writeln("[vulkan] device=", physicalDeviceName,
+            " vendor=0x", cast(uint)physicalVendorId,
+            " conservativeSync=", conservativeSync ? "on" : "off");
     }
 
     void createLogicalDevice() {
@@ -1253,8 +1363,14 @@ private:
         }
         scInfo.preTransform = caps.currentTransform;
         scInfo.compositeAlpha = chooseCompositeAlpha(caps.supportedCompositeAlpha);
+        perPixelTransparencyAvailable =
+            scInfo.compositeAlpha != VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
         writeln("[vulkan] supportedCompositeAlpha=", cast(uint)caps.supportedCompositeAlpha,
-            " chosen=", cast(uint)scInfo.compositeAlpha);
+            " chosen=", cast(uint)scInfo.compositeAlpha,
+            " (", compositeAlphaName(scInfo.compositeAlpha), ")");
+        if (scInfo.compositeAlpha == VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) {
+            writeln("[vulkan] warning: swapchain composite alpha is OPAQUE; per-pixel window transparency is unavailable on this setup.");
+        }
         scInfo.presentMode = presentMode;
         scInfo.clipped = VK_TRUE;
         scInfo.oldSwapchain = VK_NULL_HANDLE;
@@ -2039,6 +2155,20 @@ private:
             srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
             dstStage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
         }
+
+        if (conservativeSync) {
+            if (newLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) {
+                barrier.srcAccessMask |= VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+                barrier.dstAccessMask |= VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                srcStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                dstStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+            } else if (newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+                barrier.srcAccessMask |= VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                barrier.dstAccessMask |= VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT;
+                srcStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+                dstStage = VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT;
+            }
+        }
     }
 
     void initializeSwapchainImageLayouts(uint32_t imageIndex) {
@@ -2559,10 +2689,17 @@ private:
                 VkClearAttachment clr;
                 clr.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
                 clr.colorAttachment = 0;
-                clr.clearValue.color.float32[0] = 0;
-                clr.clearValue.color.float32[1] = 0;
-                clr.clearValue.color.float32[2] = 0;
-                clr.clearValue.color.float32[3] = 0;
+                if (offscreen) {
+                    clr.clearValue.color.float32[0] = 0;
+                    clr.clearValue.color.float32[1] = 0;
+                    clr.clearValue.color.float32[2] = 0;
+                    clr.clearValue.color.float32[3] = 0;
+                } else {
+                    clr.clearValue.color.float32[0] = inClearColor.r;
+                    clr.clearValue.color.float32[1] = inClearColor.g;
+                    clr.clearValue.color.float32[2] = inClearColor.b;
+                    clr.clearValue.color.float32[3] = inClearColor.a;
+                }
                 VkClearRect cr;
                 cr.baseArrayLayer = 0;
                 cr.layerCount = 1;
@@ -2657,6 +2794,7 @@ private:
         };
 
         bool rootTouched;
+        bool offscreenTouchedAny;
         bool[size_t] targetTouched;
         if (batches.length == 0) {
             renderBatchRange(0, 0, renderPass, framebuffers[imageIndex], swapchainExtent, true, false);
@@ -2671,6 +2809,19 @@ private:
                 auto stop = i;
 
                 if (target == 0) {
+                    if (conservativeSync && offscreenTouchedAny) {
+                        VkMemoryBarrier memBarrier;
+                        memBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+                        memBarrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+                        memBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT;
+                        vkCmdPipelineBarrier(cmd,
+                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                            0,
+                            1, &memBarrier,
+                            0, null,
+                            0, null);
+                    }
                     bool shouldClear = !rootTouched || batches[start].clearTarget;
                     renderBatchRange(start, stop, renderPass, framebuffers[imageIndex], swapchainExtent, shouldClear, false);
                     rootTouched = true;
@@ -2696,6 +2847,7 @@ private:
                     bool shouldClear = !touched || batches[start].clearTarget;
                     renderBatchRange(start, stop, offscreenRenderPass, fb, extent, shouldClear, true);
                     targetTouched[target] = true;
+                    offscreenTouchedAny = true;
                     recordImageLayoutTransition(cmd,
                                                 targetImage,
                                                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -2818,28 +2970,70 @@ VulkanBackendInit initVulkanBackend(int width, int height, bool isTest) {
             handle = gNextHandle++;
             gTextures[handle] = new Texture(w, h, channels, stencil, renderTarget);
         }
+        if (diagEnabled() && renderTarget) {
+            gDiagTextureEventSeq++;
+            diagStderr("texevt#" ~ gDiagTextureEventSeq.to!string ~
+                " create handle=" ~ handle.to!string ~
+                " size=" ~ w.to!string ~ "x" ~ h.to!string ~
+                " ch=" ~ channels.to!string ~
+                " stencil=" ~ (stencil ? "1" : "0"));
+        }
         return handle;
     };
     cbs.updateTexture = (size_t handle, const(ubyte)* data, size_t dataLen, int w, int h, int channels, void* userData) {
         ensureDThreadAttached();
-        if (data is null) return;
-        auto expected = cast(size_t)w * cast(size_t)h * cast(size_t)max(1, channels);
-        if (expected == 0 || dataLen < expected) return;
         synchronized (gTexturesGuard) {
             if (auto tex = handle in gTextures) {
                 if (*tex is null) return;
+                if (data is null) {
+                    // Metadata-only refresh for render targets (resize without CPU payload).
+                    (*tex).updateMeta(w, h, channels);
+                    if (diagEnabled() && (*tex).renderTarget) {
+                        gDiagTextureEventSeq++;
+                        diagStderr("texevt#" ~ gDiagTextureEventSeq.to!string ~
+                            " update-meta handle=" ~ handle.to!string ~
+                            " size=" ~ w.to!string ~ "x" ~ h.to!string ~
+                            " ch=" ~ channels.to!string ~
+                            " stencil=" ~ ((*tex).stencil ? "1" : "0"));
+                    }
+                    return;
+                }
+                auto expected = cast(size_t)w * cast(size_t)h * cast(size_t)max(1, channels);
+                if (expected == 0 || dataLen < expected) return;
                 (*tex).width = w;
                 (*tex).height = h;
                 (*tex).setData(data[0 .. expected], channels);
+                if (diagEnabled() && (*tex).renderTarget) {
+                    gDiagTextureEventSeq++;
+                    diagStderr("texevt#" ~ gDiagTextureEventSeq.to!string ~
+                        " update-data handle=" ~ handle.to!string ~
+                        " size=" ~ w.to!string ~ "x" ~ h.to!string ~
+                        " ch=" ~ channels.to!string ~
+                        " stencil=" ~ ((*tex).stencil ? "1" : "0"));
+                }
             }
         }
     };
     cbs.releaseTexture = (size_t handle, void* userData) {
         ensureDThreadAttached();
         synchronized (gTexturesGuard) {
-            if (auto tex = handle in gTextures) {
-                if (*tex !is null) (*tex).dispose();
-                gTextures.remove(handle);
+            // Defer actual release until end of frame so queued commands can still resolve handles.
+            gPendingReleaseHandles ~= handle;
+            if (diagEnabled()) {
+                bool rt = false;
+                bool st = false;
+                if (auto tex = handle in gTextures) {
+                    if (*tex !is null) {
+                        rt = (*tex).renderTarget;
+                        st = (*tex).stencil;
+                    }
+                }
+                if (rt) {
+                    gDiagTextureEventSeq++;
+                    diagStderr("texevt#" ~ gDiagTextureEventSeq.to!string ~
+                        " release handle=" ~ handle.to!string ~
+                        " stencil=" ~ (st ? "1" : "0"));
+                }
             }
         }
     };
@@ -2890,6 +3084,7 @@ void renderCommands(const VulkanBackendInit* vk,
 
     backend.postProcessScene();
     backend.endScene();
+    flushPendingTextureReleases();
 }
 
 } // version (EnableVulkanBackend)
