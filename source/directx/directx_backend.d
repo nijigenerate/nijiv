@@ -423,12 +423,6 @@ private:
     ushort[] cpuIndices;
     uint frameSeq;
     uint drawCalls;
-    uint diagBeginMaskCount;
-    uint diagBeginMaskNoStencilCount;
-    uint diagApplyMaskCount;
-    uint diagApplyMaskDodgeCount;
-    uint diagApplyMaskPartCount;
-    uint diagApplyMaskMaskCount;
     bool inMaskPass;
     bool inMaskContent;
     bool maskUsesStencil;
@@ -1961,10 +1955,6 @@ float4 psMain(VSOutput input) : SV_TARGET {
             uint srvDescriptorCursor = 0;
             bool srvHeapOverflowWarned = false;
             bool traceComposite = gRuntimeOptions.traceComposite;
-            size_t stencilNoneCount = 0;
-            size_t stencilWriteCount = 0;
-            size_t stencilTestCount = 0;
-            size_t maskSpanCount = 0;
             Texture[] frameCompositeTargets;
             size_t frameCompositeSampleCount = 0;
             size_t frameCompositeSampleSpans = 0;
@@ -1978,20 +1968,6 @@ float4 psMain(VSOutput input) : SV_TARGET {
                         " rtCount=" ~ to!string(span.renderTargetCount));
                 }
                 if (span.indexCount == 0) continue;
-                final switch (span.stencilMode) {
-                    case StencilMode.None:
-                        stencilNoneCount++;
-                        break;
-                    case StencilMode.Write:
-                        stencilWriteCount++;
-                        break;
-                    case StencilMode.TestEqual:
-                        stencilTestCount++;
-                        break;
-                }
-                if (span.isMask) {
-                    maskSpanCount++;
-                }
                 bool targetChanged = (span.renderTargetCount != currentTargetCount);
                 if (!targetChanged) {
                     foreach (i; 0 .. currentTargetCount) {
@@ -2231,12 +2207,6 @@ float4 psMain(VSOutput input) : SV_TARGET {
                 spanIndex++;
             }
             dxTrace("drawUploadedGeometry.afterSpanLoop");
-            if (isDxTraceEnabled()) {
-                dxTrace("drawUploadedGeometry.stencilSummary none=" ~ to!string(stencilNoneCount) ~
-                    " write=" ~ to!string(stencilWriteCount) ~
-                    " test=" ~ to!string(stencilTestCount) ~
-                    " maskSpans=" ~ to!string(maskSpanCount));
-            }
             foreach (i; 0 .. currentTargetCount) {
                 if (currentTargets[i] !is null) {
                     transitionTextureState(currentTargets[i], D3D12_RESOURCE_STATES.PIXEL_SHADER_RESOURCE);
@@ -2676,12 +2646,6 @@ public:
         compositeStateStack.length = 0;
         currentCompositeState = defaultCompositeState();
         drawCalls = 0;
-        diagBeginMaskCount = 0;
-        diagBeginMaskNoStencilCount = 0;
-        diagApplyMaskCount = 0;
-        diagApplyMaskDodgeCount = 0;
-        diagApplyMaskPartCount = 0;
-        diagApplyMaskMaskCount = 0;
         maskUsesStencil = false;
         maskClearPending = false;
         maskClearValue = 0;
@@ -2769,14 +2733,6 @@ public:
         auto baseVertex = cast(uint)cpuVertices.length;
         if (baseVertex > ushort.max) return;
         if (packet.vertexCount - 1 > cast(size_t)(ushort.max - baseVertex)) return;
-        float minX = float.infinity;
-        float minY = float.infinity;
-        float maxX = -float.infinity;
-        float maxY = -float.infinity;
-        float minU = float.infinity;
-        float minV = float.infinity;
-        float maxU = -float.infinity;
-        float maxV = -float.infinity;
         cpuVertices.reserve(cpuVertices.length + packet.vertexCount);
         foreach (i; 0 .. packet.vertexCount) {
             auto px = vertices.data[vxBase + i] + deform.data[dxBase + i] - packet.origin.x;
@@ -2788,16 +2744,8 @@ public:
             v.x = clip.r * invW;
             v.y = clip.g * invW;
             applyCompositeTransform(v.x, v.y);
-            if (v.x < minX) minX = v.x;
-            if (v.y < minY) minY = v.y;
-            if (v.x > maxX) maxX = v.x;
-            if (v.y > maxY) maxY = v.y;
             v.u = uvs.data[uxBase + i];
             v.v = uvs.data[uyBase + i];
-            if (v.u < minU) minU = v.u;
-            if (v.v < minV) minV = v.v;
-            if (v.u > maxU) maxU = v.u;
-            if (v.v > maxV) maxV = v.v;
             cpuVertices ~= v;
         }
 
@@ -2868,37 +2816,6 @@ public:
                 }
             }
             enqueueSpan(span);
-            if (isDxTraceEnabled() && appended <= 12) {
-                size_t th0 = (span.textureCount > 0) ? packet.textureHandles[0] : 0;
-                bool tex0Rt = false;
-                int tex0W = 0;
-                int tex0H = 0;
-                if (th0 != 0) {
-                    if (auto tex0 = th0 in texturesByHandle) {
-                        if (*tex0 !is null) {
-                            tex0Rt = (*tex0).renderTarget;
-                            tex0W = (*tex0).width;
-                            tex0H = (*tex0).height;
-                        }
-                    }
-                }
-                dxTrace("drawPartPacket.smallSpan idx=" ~ to!string(appended) ~
-                    " vtx=" ~ to!string(packet.vertexCount) ~
-                    " blend=" ~ to!string(cast(int)span.blendMode) ~
-                    " isMask=" ~ to!string(packet.isMask) ~
-                    " inMaskPass=" ~ to!string(inMaskPass) ~
-                    " inMaskContent=" ~ to!string(inMaskContent) ~
-                    " forceStencilWrite=" ~ to!string(forceStencilWrite) ~
-                    " stencilMode=" ~ to!string(cast(int)span.stencilMode) ~
-                    " stencilRef=" ~ to!string(span.stencilRef) ~
-                    " tex0=" ~ to!string(th0) ~
-                    " tex0Rt=" ~ to!string(tex0Rt) ~
-                    " tex0Size=" ~ to!string(tex0W) ~ "x" ~ to!string(tex0H) ~
-                    " uv=(" ~ to!string(minU) ~ "," ~ to!string(minV) ~ ")-(" ~
-                    to!string(maxU) ~ "," ~ to!string(maxV) ~ ")" ~
-                    " bbox=(" ~ to!string(minX) ~ "," ~ to!string(minY) ~ ")-(" ~
-                    to!string(maxX) ~ "," ~ to!string(maxY) ~ ")");
-            }
         }
         drawCalls++;
     }
@@ -3059,10 +2976,6 @@ public:
         }
     }
     void beginMask(bool usesStencil) {
-        diagBeginMaskCount++;
-        if (!usesStencil) {
-            diagBeginMaskNoStencilCount++;
-        }
         inMaskPass = true;
         inMaskContent = false;
         maskUsesStencil = usesStencil;
@@ -3071,31 +2984,9 @@ public:
         maskContentStencilRef = 1;
     }
     void applyMask(ref const(NjgMaskApplyPacket) packet, Texture[size_t] texturesByHandle) {
-        diagApplyMaskCount++;
-        if (packet.isDodge) {
-            diagApplyMaskDodgeCount++;
-        }
-        if (packet.kind == MaskDrawableKind.Part) {
-            diagApplyMaskPartCount++;
-        } else {
-            diagApplyMaskMaskCount++;
-        }
         forceStencilWrite = true;
         forceStencilRef = packet.isDodge ? cast(ubyte)0 : cast(ubyte)1;
         maskContentStencilRef = forceStencilRef;
-        if (isDxTraceEnabled()) {
-            if (packet.kind == MaskDrawableKind.Part) {
-                dxTrace("applyMask.part isDodge=" ~ to!string(packet.isDodge) ~
-                    " part.isMask=" ~ to!string(packet.partPacket.isMask) ~
-                    " threshold=" ~ to!string(packet.partPacket.maskThreshold) ~
-                    " vtx=" ~ to!string(packet.partPacket.vertexCount) ~
-                    " idx=" ~ to!string(packet.partPacket.indexCount));
-            } else {
-                dxTrace("applyMask.mask isDodge=" ~ to!string(packet.isDodge) ~
-                    " vtx=" ~ to!string(packet.maskPacket.vertexCount) ~
-                    " idx=" ~ to!string(packet.maskPacket.indexCount));
-            }
-        }
         final switch (packet.kind) {
             case MaskDrawableKind.Part:
                 NjgPartDrawPacket masked = packet.partPacket;
@@ -3124,13 +3015,7 @@ public:
         if (isDxTraceEnabled()) {
             dxTrace("endScene.counts vertices=" ~ to!string(cpuVertices.length) ~
                 " indices=" ~ to!string(cpuIndices.length) ~
-                " spans=" ~ to!string(drawSpans.length) ~
-                " beginMask=" ~ to!string(diagBeginMaskCount) ~
-                " beginMaskNoStencil=" ~ to!string(diagBeginMaskNoStencilCount) ~
-                " applyMask=" ~ to!string(diagApplyMaskCount) ~
-                " applyMaskDodge=" ~ to!string(diagApplyMaskDodgeCount) ~
-                " applyPart=" ~ to!string(diagApplyMaskPartCount) ~
-                " applyMaskGeom=" ~ to!string(diagApplyMaskMaskCount));
+                " spans=" ~ to!string(drawSpans.length));
         }
         bool skipDraw = gRuntimeOptions.skipDraw;
         bool skipPresent = gRuntimeOptions.skipPresent;
@@ -3251,13 +3136,6 @@ DirectXBackendInit initDirectXBackend(int width, int height, bool isTest) {
     cbs.createTexture = (int w, int h, int channels, int mipLevels, int format, bool renderTarget, bool stencil, void* userData) {
         size_t handle = gNextHandle++;
         gTextures[handle] = new Texture(w, h, channels, stencil, renderTarget);
-        if (isDxTraceEnabled() && gRuntimeOptions.traceTexOps) {
-            dxTrace("createTexture h=" ~ to!string(handle) ~
-                " size=" ~ to!string(w) ~ "x" ~ to!string(h) ~
-                " ch=" ~ to!string(channels) ~
-                " rt=" ~ to!string(renderTarget) ~
-                " stencil=" ~ to!string(stencil));
-        }
         return handle;
     };
     cbs.updateTexture = (size_t handle, const(ubyte)* data, size_t dataLen, int w, int h, int channels, void* userData) {
