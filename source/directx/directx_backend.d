@@ -9,7 +9,6 @@ import std.math : isNaN, cos, sin;
 import std.stdio : writeln, stdout;
 import std.string : fromStringz;
 import core.stdc.string : memcpy;
-import core.stdc.stdlib : getenv;
 import core.sys.windows.com : CoInitializeEx, COINIT_MULTITHREADED;
 import core.sys.windows.windows : HANDLE, HWND, RECT, CloseHandle, CreateEventW, WaitForSingleObject, INFINITE, GetClientRect;
 import core.sys.windows.windef : HRESULT;
@@ -46,6 +45,24 @@ struct Vec4f {
     float g;
     float b;
     float a;
+}
+
+struct DirectXRuntimeOptions {
+    bool trace;
+    bool debugLayer;
+    bool traceComposite;
+    bool traceDrawOps;
+    bool traceTexOps;
+    bool skipRootConstants;
+    bool skipTexBarriers;
+    bool skipDraw;
+    bool skipPresent;
+}
+
+private __gshared DirectXRuntimeOptions gRuntimeOptions;
+
+void setDirectXRuntimeOptions(DirectXRuntimeOptions opts) {
+    gRuntimeOptions = opts;
 }
 
 enum MaskDrawableKind : uint {
@@ -108,17 +125,7 @@ bool isDeviceLossHr(HRESULT hr) @safe pure nothrow {
 }
 
 bool isDxTraceEnabled() {
-    auto p = getenv("NJIV_DX_TRACE");
-    if (p is null) return false;
-    auto v = fromStringz(p).idup;
-    return v == "1" || v == "true" || v == "TRUE";
-}
-
-bool isDxFlag(scope const(char)[] name) {
-    auto p = getenv(name.ptr);
-    if (p is null) return false;
-    auto v = fromStringz(p).idup;
-    return v == "1" || v == "true" || v == "TRUE";
+    return gRuntimeOptions.trace;
 }
 
 void dxTrace(scope const(char)[] msg) {
@@ -416,11 +423,18 @@ private:
     ushort[] cpuIndices;
     uint frameSeq;
     uint drawCalls;
+    uint diagBeginMaskCount;
+    uint diagBeginMaskNoStencilCount;
+    uint diagApplyMaskCount;
+    uint diagApplyMaskDodgeCount;
+    uint diagApplyMaskPartCount;
+    uint diagApplyMaskMaskCount;
     bool inMaskPass;
     bool inMaskContent;
     bool maskUsesStencil;
     bool maskClearPending;
     ubyte maskClearValue;
+    ubyte maskContentStencilRef = 1;
     bool forceStencilWrite;
     ubyte forceStencilRef;
     bool inDynamicComposite;
@@ -1088,7 +1102,7 @@ private:
                 return;
             }
             if (tex.gpuState == after) return;
-            if (isDxFlag("NJIV_DX_SKIP_TEX_BARRIERS")) {
+            if (gRuntimeOptions.skipTexBarriers) {
                 tex.gpuState = after;
                 return;
             }
@@ -1360,7 +1374,7 @@ float4 sampleTex(Texture2D tex, float2 uv, float flipY) {
     return tex.Sample(gSamp, su);
 }
 float4 psMain(VSOutput input) : SV_TARGET {
-    float2 uv = saturate(input.uv);
+    float2 uv = input.uv;
     float4 c0 = sampleTex(gTex0, uv, flipTex0);
     float4 c1 = sampleTex(gTex1, uv, flipTex1);
     float4 c2 = sampleTex(gTex2, uv, flipTex2);
@@ -1464,13 +1478,13 @@ float4 psMain(VSOutput input) : SV_TARGET {
             rootParams[1] = rootConstantsParam;
             D3D12_STATIC_SAMPLER_DESC staticSampler = D3D12_STATIC_SAMPLER_DESC.init;
             staticSampler.Filter = D3D12_FILTER.MIN_MAG_MIP_LINEAR;
-            staticSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE.CLAMP;
-            staticSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE.CLAMP;
-            staticSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE.CLAMP;
+            staticSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE.BORDER;
+            staticSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE.BORDER;
+            staticSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE.BORDER;
             staticSampler.MipLODBias = 0;
             staticSampler.MaxAnisotropy = 1;
             staticSampler.ComparisonFunc = D3D12_COMPARISON_FUNC.ALWAYS;
-            staticSampler.BorderColor = D3D12_STATIC_BORDER_COLOR.OPAQUE_BLACK;
+            staticSampler.BorderColor = D3D12_STATIC_BORDER_COLOR.TRANSPARENT_BLACK;
             staticSampler.MinLOD = 0;
             staticSampler.MaxLOD = 0;
             staticSampler.ShaderRegister = 0;
@@ -1946,20 +1960,38 @@ float4 psMain(VSOutput input) : SV_TARGET {
             size_t spanIndex = 0;
             uint srvDescriptorCursor = 0;
             bool srvHeapOverflowWarned = false;
-            bool traceComposite = isDxFlag("NJIV_DX_TRACE_COMPOSITE");
+            bool traceComposite = gRuntimeOptions.traceComposite;
+            size_t stencilNoneCount = 0;
+            size_t stencilWriteCount = 0;
+            size_t stencilTestCount = 0;
+            size_t maskSpanCount = 0;
             Texture[] frameCompositeTargets;
             size_t frameCompositeSampleCount = 0;
             size_t frameCompositeSampleSpans = 0;
             bindBackbufferTarget();
             currentTargetHasStencil = true;
             foreach (span; spans) {
-                bool traceOps = isDxFlag("NJIV_DX_TRACE_DRAWOPS");
+                bool traceOps = gRuntimeOptions.traceDrawOps;
                 if (isDxTraceEnabled() && (spanIndex % 16 == 0)) {
                     dxTrace("drawUploadedGeometry.span i=" ~ to!string(spanIndex) ~
                         " idxCount=" ~ to!string(span.indexCount) ~
                         " rtCount=" ~ to!string(span.renderTargetCount));
                 }
                 if (span.indexCount == 0) continue;
+                final switch (span.stencilMode) {
+                    case StencilMode.None:
+                        stencilNoneCount++;
+                        break;
+                    case StencilMode.Write:
+                        stencilWriteCount++;
+                        break;
+                    case StencilMode.TestEqual:
+                        stencilTestCount++;
+                        break;
+                }
+                if (span.isMask) {
+                    maskSpanCount++;
+                }
                 bool targetChanged = (span.renderTargetCount != currentTargetCount);
                 if (!targetChanged) {
                     foreach (i; 0 .. currentTargetCount) {
@@ -2036,7 +2068,7 @@ float4 psMain(VSOutput input) : SV_TARGET {
                     if (t is null) {
                         t = fallbackTexture;
                     }
-                    bool traceTexOps = isDxFlag("NJIV_DX_TRACE_TEXOPS");
+                    bool traceTexOps = gRuntimeOptions.traceTexOps;
                     if (traceTexOps) {
                         dxTrace("drawUploadedGeometry.tex slot=" ~ to!string(slot) ~
                             " span=" ~ to!string(spanIndex) ~
@@ -2115,7 +2147,7 @@ float4 psMain(VSOutput input) : SV_TARGET {
                 drawParams[13] = span.clampedScreen.y;
                 drawParams[14] = span.clampedScreen.z;
                 drawParams[15] = 0.0f;
-                if (!isDxFlag("NJIV_DX_SKIP_ROOT_CONSTANTS")) {
+                if (!gRuntimeOptions.skipRootConstants) {
                     commandListPtr.value.SetGraphicsRoot32BitConstants(1, 16, drawParams.ptr, 0);
                 }
 
@@ -2199,6 +2231,12 @@ float4 psMain(VSOutput input) : SV_TARGET {
                 spanIndex++;
             }
             dxTrace("drawUploadedGeometry.afterSpanLoop");
+            if (isDxTraceEnabled()) {
+                dxTrace("drawUploadedGeometry.stencilSummary none=" ~ to!string(stencilNoneCount) ~
+                    " write=" ~ to!string(stencilWriteCount) ~
+                    " test=" ~ to!string(stencilTestCount) ~
+                    " maskSpans=" ~ to!string(maskSpanCount));
+            }
             foreach (i; 0 .. currentTargetCount) {
                 if (currentTargets[i] !is null) {
                     transitionTextureState(currentTargets[i], D3D12_RESOURCE_STATES.PIXEL_SHADER_RESOURCE);
@@ -2435,7 +2473,9 @@ float4 psMain(VSOutput input) : SV_TARGET {
             auto rtv = currentRtvHandle();
             auto dsv = dsvHandle();
             commandListPtr.value.OMSetRenderTargets(1, &rtv, true, &dsv);
-            const(float)[4] clearColor = [0.08f, 0.10f, 0.13f, 1.0f];
+            // Keep destination alpha clear at 0 so ClipToLower/SliceFromLower
+            // blend modes can build clipping from actual lower-layer writes.
+            const(float)[4] clearColor = [0.08f, 0.10f, 0.13f, 0.0f];
             commandListPtr.value.ClearRenderTargetView(rtv, clearColor.ptr, 0, null);
             commandListPtr.value.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS.STENCIL, 1.0f, 0, 0, null);
         }
@@ -2560,7 +2600,7 @@ public:
         dxTrace("RenderingBackend.initializeRenderer.requireWindowHandle");
         auto hwnd = requireWindowHandle(window);
         dxTrace("RenderingBackend.initializeRenderer.dx.initialize");
-        dx.initialize(hwnd, max(1, viewportW), max(1, viewportH), isDxFlag("NJIV_DX_DEBUG_LAYER"));
+        dx.initialize(hwnd, max(1, viewportW), max(1, viewportH), gRuntimeOptions.debugLayer);
         dxTrace("RenderingBackend.initializeRenderer.dx.initialize.done");
         if (!announced) {
             writeln("[directx] initialized D3D12 runtime with aurora-directx");
@@ -2636,6 +2676,12 @@ public:
         compositeStateStack.length = 0;
         currentCompositeState = defaultCompositeState();
         drawCalls = 0;
+        diagBeginMaskCount = 0;
+        diagBeginMaskNoStencilCount = 0;
+        diagApplyMaskCount = 0;
+        diagApplyMaskDodgeCount = 0;
+        diagApplyMaskPartCount = 0;
+        diagApplyMaskMaskCount = 0;
         maskUsesStencil = false;
         maskClearPending = false;
         maskClearValue = 0;
@@ -2723,6 +2769,14 @@ public:
         auto baseVertex = cast(uint)cpuVertices.length;
         if (baseVertex > ushort.max) return;
         if (packet.vertexCount - 1 > cast(size_t)(ushort.max - baseVertex)) return;
+        float minX = float.infinity;
+        float minY = float.infinity;
+        float maxX = -float.infinity;
+        float maxY = -float.infinity;
+        float minU = float.infinity;
+        float minV = float.infinity;
+        float maxU = -float.infinity;
+        float maxV = -float.infinity;
         cpuVertices.reserve(cpuVertices.length + packet.vertexCount);
         foreach (i; 0 .. packet.vertexCount) {
             auto px = vertices.data[vxBase + i] + deform.data[dxBase + i] - packet.origin.x;
@@ -2734,8 +2788,16 @@ public:
             v.x = clip.r * invW;
             v.y = clip.g * invW;
             applyCompositeTransform(v.x, v.y);
+            if (v.x < minX) minX = v.x;
+            if (v.y < minY) minY = v.y;
+            if (v.x > maxX) maxX = v.x;
+            if (v.y > maxY) maxY = v.y;
             v.u = uvs.data[uxBase + i];
             v.v = uvs.data[uyBase + i];
+            if (v.u < minU) minU = v.u;
+            if (v.v < minV) minV = v.v;
+            if (v.u > maxU) maxU = v.u;
+            if (v.v > maxV) maxV = v.v;
             cpuVertices ~= v;
         }
 
@@ -2802,10 +2864,41 @@ public:
                 } else {
                     span.isMask = false;
                     span.stencilMode = StencilMode.TestEqual;
-                    span.stencilRef = 1;
+                    span.stencilRef = maskContentStencilRef;
                 }
             }
             enqueueSpan(span);
+            if (isDxTraceEnabled() && appended <= 12) {
+                size_t th0 = (span.textureCount > 0) ? packet.textureHandles[0] : 0;
+                bool tex0Rt = false;
+                int tex0W = 0;
+                int tex0H = 0;
+                if (th0 != 0) {
+                    if (auto tex0 = th0 in texturesByHandle) {
+                        if (*tex0 !is null) {
+                            tex0Rt = (*tex0).renderTarget;
+                            tex0W = (*tex0).width;
+                            tex0H = (*tex0).height;
+                        }
+                    }
+                }
+                dxTrace("drawPartPacket.smallSpan idx=" ~ to!string(appended) ~
+                    " vtx=" ~ to!string(packet.vertexCount) ~
+                    " blend=" ~ to!string(cast(int)span.blendMode) ~
+                    " isMask=" ~ to!string(packet.isMask) ~
+                    " inMaskPass=" ~ to!string(inMaskPass) ~
+                    " inMaskContent=" ~ to!string(inMaskContent) ~
+                    " forceStencilWrite=" ~ to!string(forceStencilWrite) ~
+                    " stencilMode=" ~ to!string(cast(int)span.stencilMode) ~
+                    " stencilRef=" ~ to!string(span.stencilRef) ~
+                    " tex0=" ~ to!string(th0) ~
+                    " tex0Rt=" ~ to!string(tex0Rt) ~
+                    " tex0Size=" ~ to!string(tex0W) ~ "x" ~ to!string(tex0H) ~
+                    " uv=(" ~ to!string(minU) ~ "," ~ to!string(minV) ~ ")-(" ~
+                    to!string(maxU) ~ "," ~ to!string(maxV) ~ ")" ~
+                    " bbox=(" ~ to!string(minX) ~ "," ~ to!string(minY) ~ ")-(" ~
+                    to!string(maxX) ~ "," ~ to!string(maxY) ~ ")");
+            }
         }
         drawCalls++;
     }
@@ -2903,7 +2996,7 @@ public:
             } else if (inMaskPass && inMaskContent) {
                 span.isMask = false;
                 span.stencilMode = StencilMode.TestEqual;
-                span.stencilRef = 1;
+                span.stencilRef = maskContentStencilRef;
             }
 
             enqueueSpan(span);
@@ -2966,15 +3059,43 @@ public:
         }
     }
     void beginMask(bool usesStencil) {
+        diagBeginMaskCount++;
+        if (!usesStencil) {
+            diagBeginMaskNoStencilCount++;
+        }
         inMaskPass = true;
         inMaskContent = false;
         maskUsesStencil = usesStencil;
         maskClearPending = true;
         maskClearValue = usesStencil ? cast(ubyte)0 : cast(ubyte)1;
+        maskContentStencilRef = 1;
     }
     void applyMask(ref const(NjgMaskApplyPacket) packet, Texture[size_t] texturesByHandle) {
+        diagApplyMaskCount++;
+        if (packet.isDodge) {
+            diagApplyMaskDodgeCount++;
+        }
+        if (packet.kind == MaskDrawableKind.Part) {
+            diagApplyMaskPartCount++;
+        } else {
+            diagApplyMaskMaskCount++;
+        }
         forceStencilWrite = true;
         forceStencilRef = packet.isDodge ? cast(ubyte)0 : cast(ubyte)1;
+        maskContentStencilRef = forceStencilRef;
+        if (isDxTraceEnabled()) {
+            if (packet.kind == MaskDrawableKind.Part) {
+                dxTrace("applyMask.part isDodge=" ~ to!string(packet.isDodge) ~
+                    " part.isMask=" ~ to!string(packet.partPacket.isMask) ~
+                    " threshold=" ~ to!string(packet.partPacket.maskThreshold) ~
+                    " vtx=" ~ to!string(packet.partPacket.vertexCount) ~
+                    " idx=" ~ to!string(packet.partPacket.indexCount));
+            } else {
+                dxTrace("applyMask.mask isDodge=" ~ to!string(packet.isDodge) ~
+                    " vtx=" ~ to!string(packet.maskPacket.vertexCount) ~
+                    " idx=" ~ to!string(packet.maskPacket.indexCount));
+            }
+        }
         final switch (packet.kind) {
             case MaskDrawableKind.Part:
                 NjgPartDrawPacket masked = packet.partPacket;
@@ -3003,10 +3124,16 @@ public:
         if (isDxTraceEnabled()) {
             dxTrace("endScene.counts vertices=" ~ to!string(cpuVertices.length) ~
                 " indices=" ~ to!string(cpuIndices.length) ~
-                " spans=" ~ to!string(drawSpans.length));
+                " spans=" ~ to!string(drawSpans.length) ~
+                " beginMask=" ~ to!string(diagBeginMaskCount) ~
+                " beginMaskNoStencil=" ~ to!string(diagBeginMaskNoStencilCount) ~
+                " applyMask=" ~ to!string(diagApplyMaskCount) ~
+                " applyMaskDodge=" ~ to!string(diagApplyMaskDodgeCount) ~
+                " applyPart=" ~ to!string(diagApplyMaskPartCount) ~
+                " applyMaskGeom=" ~ to!string(diagApplyMaskMaskCount));
         }
-        bool skipDraw = isDxFlag("NJIV_DX_SKIP_DRAW");
-        bool skipPresent = isDxFlag("NJIV_DX_SKIP_PRESENT");
+        bool skipDraw = gRuntimeOptions.skipDraw;
+        bool skipPresent = gRuntimeOptions.skipPresent;
         if (skipDraw) {
             dxTrace("endScene.skipDraw");
         } else {
@@ -3124,6 +3251,13 @@ DirectXBackendInit initDirectXBackend(int width, int height, bool isTest) {
     cbs.createTexture = (int w, int h, int channels, int mipLevels, int format, bool renderTarget, bool stencil, void* userData) {
         size_t handle = gNextHandle++;
         gTextures[handle] = new Texture(w, h, channels, stencil, renderTarget);
+        if (isDxTraceEnabled() && gRuntimeOptions.traceTexOps) {
+            dxTrace("createTexture h=" ~ to!string(handle) ~
+                " size=" ~ to!string(w) ~ "x" ~ to!string(h) ~
+                " ch=" ~ to!string(channels) ~
+                " rt=" ~ to!string(renderTarget) ~
+                " stencil=" ~ to!string(stencil));
+        }
         return handle;
     };
     cbs.updateTexture = (size_t handle, const(ubyte)* data, size_t dataLen, int w, int h, int channels, void* userData) {
