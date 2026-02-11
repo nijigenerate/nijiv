@@ -11,7 +11,7 @@ import std.string : fromStringz;
 import core.stdc.string : memcpy;
 import core.stdc.stdlib : getenv;
 import core.sys.windows.com : CoInitializeEx, COINIT_MULTITHREADED;
-import core.sys.windows.windows : HANDLE, HWND, CloseHandle, CreateEventW, WaitForSingleObject, INFINITE;
+import core.sys.windows.windows : HANDLE, HWND, RECT, CloseHandle, CreateEventW, WaitForSingleObject, INFINITE, GetClientRect;
 import core.sys.windows.windef : HRESULT;
 
 import bindbc.sdl;
@@ -629,6 +629,14 @@ private:
                 s.RenderTarget[0].SrcBlendAlpha = src;
                 s.RenderTarget[0].DestBlendAlpha = dst;
             };
+            auto setColorBlend = (D3D12_BLEND srcColor, D3D12_BLEND dstColor) {
+                // D3D12 PSO creation can reject some color factors in alpha channels.
+                // Keep alpha channel on standard compositing while varying color factors.
+                s.RenderTarget[0].SrcBlend = srcColor;
+                s.RenderTarget[0].DestBlend = dstColor;
+                s.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND.ONE;
+                s.RenderTarget[0].DestBlendAlpha = D3D12_BLEND.INV_SRC_ALPHA;
+            };
             auto setBlendFuncSeparate = (D3D12_BLEND srcColor,
                                          D3D12_BLEND dstColor,
                                          D3D12_BLEND srcAlpha,
@@ -648,12 +656,12 @@ private:
                 case BlendMode.Multiply:
                     s.RenderTarget[0].BlendOp = D3D12_BLEND_OP.ADD;
                     s.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP.ADD;
-                    setBlendFunc(D3D12_BLEND.DEST_COLOR, D3D12_BLEND.INV_SRC_ALPHA);
+                    setColorBlend(D3D12_BLEND.DEST_COLOR, D3D12_BLEND.INV_SRC_ALPHA);
                     break;
                 case BlendMode.Screen:
                     s.RenderTarget[0].BlendOp = D3D12_BLEND_OP.ADD;
                     s.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP.ADD;
-                    setBlendFunc(D3D12_BLEND.ONE, D3D12_BLEND.INV_SRC_COLOR);
+                    setColorBlend(D3D12_BLEND.ONE, D3D12_BLEND.INV_SRC_COLOR);
                     break;
                 case BlendMode.Overlay:
                 case BlendMode.ColorBurn:
@@ -678,7 +686,7 @@ private:
                 case BlendMode.ColorDodge:
                     s.RenderTarget[0].BlendOp = D3D12_BLEND_OP.ADD;
                     s.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP.ADD;
-                    setBlendFunc(D3D12_BLEND.DEST_COLOR, D3D12_BLEND.ONE);
+                    setColorBlend(D3D12_BLEND.DEST_COLOR, D3D12_BLEND.ONE);
                     break;
                 case BlendMode.LinearDodge:
                     s.RenderTarget[0].BlendOp = D3D12_BLEND_OP.ADD;
@@ -707,12 +715,12 @@ private:
                 case BlendMode.Subtract:
                     s.RenderTarget[0].BlendOp = D3D12_BLEND_OP.REV_SUBTRACT;
                     s.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP.ADD;
-                    setBlendFunc(D3D12_BLEND.INV_DEST_COLOR, D3D12_BLEND.ONE);
+                    setColorBlend(D3D12_BLEND.INV_DEST_COLOR, D3D12_BLEND.ONE);
                     break;
                 case BlendMode.Inverse:
                     s.RenderTarget[0].BlendOp = D3D12_BLEND_OP.ADD;
                     s.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP.ADD;
-                    setBlendFunc(D3D12_BLEND.INV_DEST_COLOR, D3D12_BLEND.INV_SRC_ALPHA);
+                    setColorBlend(D3D12_BLEND.INV_DEST_COLOR, D3D12_BLEND.INV_SRC_ALPHA);
                     break;
                 case BlendMode.DestinationIn:
                     s.RenderTarget[0].BlendOp = D3D12_BLEND_OP.ADD;
@@ -1334,21 +1342,28 @@ cbuffer DrawParams : register(b0) {
     float emissionStrength;
     float isMask;
     float maskThreshold;
-    float pad0;
-    float pad1;
+    float flipTex0;
+    float flipTex1;
     float3 multColor;
-    float multPad;
+    float flipTex2;
     float3 screenColor;
     float screenPad;
 }
 float3 screenBlend(float3 tcol, float a, float3 sc) {
     return 1.0.xxx - ((1.0.xxx - tcol) * (1.0.xxx - (sc * a)));
 }
+float4 sampleTex(Texture2D tex, float2 uv, float flipY) {
+    float2 su = uv;
+    if (flipY > 0.5) {
+        su.y = 1.0 - su.y;
+    }
+    return tex.Sample(gSamp, su);
+}
 float4 psMain(VSOutput input) : SV_TARGET {
     float2 uv = saturate(input.uv);
-    float4 c0 = gTex0.Sample(gSamp, uv);
-    float4 c1 = gTex1.Sample(gSamp, uv);
-    float4 c2 = gTex2.Sample(gSamp, uv);
+    float4 c0 = sampleTex(gTex0, uv, flipTex0);
+    float4 c1 = sampleTex(gTex1, uv, flipTex1);
+    float4 c2 = sampleTex(gTex2, uv, flipTex2);
     if (isMask > 0.5) {
         if (c0.a <= maskThreshold) discard;
         return float4(1, 1, 1, 1);
@@ -1928,6 +1943,10 @@ float4 psMain(VSOutput input) : SV_TARGET {
             size_t spanIndex = 0;
             uint srvDescriptorCursor = 0;
             bool srvHeapOverflowWarned = false;
+            bool traceComposite = isDxFlag("NJIV_DX_TRACE_COMPOSITE");
+            Texture[] frameCompositeTargets;
+            size_t frameCompositeSampleCount = 0;
+            size_t frameCompositeSampleSpans = 0;
             bindBackbufferTarget();
             currentTargetHasStencil = true;
             foreach (span; spans) {
@@ -1960,6 +1979,20 @@ float4 psMain(VSOutput input) : SV_TARGET {
                     }
                     currentTargetCount = span.renderTargetCount;
                     currentTargets = span.renderTargets;
+                    if (currentTargetCount > 0) {
+                        foreach (i; 0 .. currentTargetCount) {
+                            auto rt = currentTargets[i];
+                            if (rt is null) continue;
+                            bool duplicate = false;
+                            foreach (e; frameCompositeTargets) {
+                                if (e is rt) {
+                                    duplicate = true;
+                                    break;
+                                }
+                            }
+                            if (!duplicate) frameCompositeTargets ~= rt;
+                        }
+                    }
                     if (currentTargetCount == 0 || currentTargets[0] is null) {
                         bindBackbufferTarget();
                         currentTargetHasStencil = true;
@@ -1978,12 +2011,10 @@ float4 psMain(VSOutput input) : SV_TARGET {
                         }
                     }
                 }
-                auto tex0 = span.textures[0];
-                if (tex0 is null || tex0.pixelCount == 0) continue;
-
                 // Each draw needs its own SRV table. Reusing the same slots causes all draws
                 // to sample whichever texture was written last once GPU executes the command list.
                 uint descriptorBase = 0;
+                bool[3] texFlipY = [false, false, false];
                 bool descriptorSliceValid = (srvDescriptorCapacity >= 3 &&
                     srvDescriptorCursor <= srvDescriptorCapacity - 3);
                 if (descriptorSliceValid) {
@@ -1996,12 +2027,10 @@ float4 psMain(VSOutput input) : SV_TARGET {
 
                 foreach (slot; 0 .. 3) {
                     Texture t = null;
-                    if (slot < span.textureCount && span.textures[slot] !is null && span.textures[slot].pixelCount > 0) {
+                    if (slot < span.textureCount && span.textures[slot] !is null) {
                         t = span.textures[slot];
-                    } else {
-                        t = tex0;
                     }
-                    if (t is null || t.pixelCount == 0) {
+                    if (t is null) {
                         t = fallbackTexture;
                     }
                     bool traceTexOps = isDxFlag("NJIV_DX_TRACE_TEXOPS");
@@ -2034,6 +2063,16 @@ float4 psMain(VSOutput input) : SV_TARGET {
                         ensureTextureUploaded(t);
                         if (t.gpuTexture is null) continue;
                     }
+                    texFlipY[slot] = t.renderTarget;
+                    if (traceComposite && currentTargetCount == 0) {
+                        foreach (rt; frameCompositeTargets) {
+                            if (t is rt) {
+                                frameCompositeSampleCount++;
+                                if (slot == 0) frameCompositeSampleSpans++;
+                                break;
+                            }
+                        }
+                    }
                     if (traceTexOps) {
                         dxTrace("drawUploadedGeometry.tex slot=" ~ to!string(slot) ~
                             " span=" ~ to!string(spanIndex) ~
@@ -2063,12 +2102,12 @@ float4 psMain(VSOutput input) : SV_TARGET {
                 drawParams[3] = span.emissionStrength;
                 drawParams[4] = span.isMask ? 1.0f : 0.0f;
                 drawParams[5] = span.maskThreshold;
-                drawParams[6] = 0.0f;
-                drawParams[7] = 0.0f;
+                drawParams[6] = texFlipY[0] ? 1.0f : 0.0f;
+                drawParams[7] = texFlipY[1] ? 1.0f : 0.0f;
                 drawParams[8] = span.clampedTint.x;
                 drawParams[9] = span.clampedTint.y;
                 drawParams[10] = span.clampedTint.z;
-                drawParams[11] = 0.0f;
+                drawParams[11] = texFlipY[2] ? 1.0f : 0.0f;
                 drawParams[12] = span.clampedScreen.x;
                 drawParams[13] = span.clampedScreen.y;
                 drawParams[14] = span.clampedScreen.z;
@@ -2165,6 +2204,11 @@ float4 psMain(VSOutput input) : SV_TARGET {
             dxTrace("drawUploadedGeometry.afterRestoreRtStates");
             if (currentTargetCount > 0) {
                 bindBackbufferTarget();
+            }
+            if (traceComposite) {
+                dxTrace("drawUploadedGeometry.compositeStats targets=" ~ to!string(frameCompositeTargets.length) ~
+                    " sampledSlots=" ~ to!string(frameCompositeSampleCount) ~
+                    " sampledSpans=" ~ to!string(frameCompositeSampleSpans));
             }
             dxTrace("drawUploadedGeometry.done");
         }
@@ -2522,9 +2566,12 @@ public:
     }
 
     void setViewport(int w, int h) {
-        viewportW = w;
-        viewportH = h;
-        dx.resizeSwapChain(max(1, w), max(1, h));
+        int targetW = w;
+        int targetH = h;
+        queryWindowPixelSize(window, targetW, targetH);
+        viewportW = targetW;
+        viewportH = targetH;
+        dx.resizeSwapChain(max(1, targetW), max(1, targetH));
     }
 
     void setSharedSnapshot(const SharedBufferSnapshot* snapshot) {
@@ -2634,34 +2681,10 @@ public:
     }
 
     void applyCompositeTransform(ref float x, ref float y) {
+        // GL/VK backends do not apply extra CPU-side dynamic-composite transforms here.
+        // Keep DX consistent and rely on matrices supplied by the command stream.
         if (dynamicCompositeDepth == 0) return;
-        auto sx = (currentCompositeState.scale.x == 0 || isNaN(currentCompositeState.scale.x))
-            ? 1.0f : currentCompositeState.scale.x;
-        auto sy = (currentCompositeState.scale.y == 0 || isNaN(currentCompositeState.scale.y))
-            ? 1.0f : currentCompositeState.scale.y;
-        if (currentCompositeState.autoScaled) {
-            auto ow = max(1, currentCompositeState.origViewport[2]);
-            auto oh = max(1, currentCompositeState.origViewport[3]);
-            sx *= cast(float)viewportW / cast(float)ow;
-            sy *= cast(float)viewportH / cast(float)oh;
-        }
-        auto rot = isNaN(currentCompositeState.rotationZ) ? 0.0f : currentCompositeState.rotationZ;
-        auto c = cast(float)cos(rot);
-        auto s = cast(float)sin(rot);
-
-        float rx = x * c - y * s;
-        float ry = x * s + y * c;
-        x = rx * sx;
-        y = ry * sy;
-
-        auto ox = currentCompositeState.origViewport[0];
-        auto oy = currentCompositeState.origViewport[1];
-        if (ox != 0 || oy != 0) {
-            auto nx = (2.0f * cast(float)ox) / cast(float)max(1, viewportW);
-            auto ny = (2.0f * cast(float)oy) / cast(float)max(1, viewportH);
-            x += nx;
-            y -= ny;
-        }
+        return;
     }
 
     void drawPartPacket(ref const(NjgPartDrawPacket) packet, Texture[size_t] texturesByHandle) {
@@ -2773,14 +2796,6 @@ public:
                     }
                 }
             }
-            if (inDynamicComposite &&
-                (currentCompositeState.stencil != 0 || currentCompositeState.hasStencil) &&
-                !span.isMask)
-            {
-                // Approximate composite stencil gating.
-                span.blendMode = BlendMode.ClipToLower;
-            }
-
             enqueueSpan(span);
         }
         drawCalls++;
@@ -2879,7 +2894,19 @@ public:
         }
     }
     void beginDynamicComposite(NjgDynamicCompositePass pass) {
-        dxTrace("beginDynamicComposite");
+        if (isDxTraceEnabled()) {
+            dxTrace("beginDynamicComposite"
+                ~ " texCount=" ~ to!string(pass.textureCount)
+                ~ " scale=(" ~ to!string(pass.scale.x) ~ "," ~ to!string(pass.scale.y) ~ ")"
+                ~ " rotZ=" ~ to!string(pass.rotationZ)
+                ~ " autoScaled=" ~ to!string(pass.autoScaled)
+                ~ " origViewport=(" ~ to!string(pass.origViewport[0]) ~ ","
+                ~ to!string(pass.origViewport[1]) ~ ","
+                ~ to!string(pass.origViewport[2]) ~ ","
+                ~ to!string(pass.origViewport[3]) ~ ")"
+                ~ " drawBuffers=" ~ to!string(pass.drawBufferCount)
+                ~ " hasStencil=" ~ to!string(pass.hasStencil));
+        }
         inDynamicComposite = true;
         dynamicCompositeDepth++;
         CompositeState st;
@@ -3017,6 +3044,31 @@ string sdlError() {
     return fromStringz(msg).idup;
 }
 
+void queryWindowPixelSize(SDL_Window* window, out int w, out int h) {
+    w = 1;
+    h = 1;
+    if (window is null) return;
+
+    SDL_GetWindowSize(window, &w, &h);
+    if (w <= 0) w = 1;
+    if (h <= 0) h = 1;
+
+    SDL_SysWMinfo info = SDL_SysWMinfo.init;
+    SDL_VERSION(&info.version_);
+    if (SDL_GetWindowWMInfo(window, &info) == SDL_TRUE &&
+        info.subsystem == SDL_SYSWM_WINDOWS &&
+        info.info.win.window !is null)
+    {
+        RECT rc = RECT.init;
+        if (GetClientRect(cast(HWND)info.info.win.window, &rc) != 0) {
+            auto pw = rc.right - rc.left;
+            auto ph = rc.bottom - rc.top;
+            if (pw > 0) w = pw;
+            if (ph > 0) h = ph;
+        }
+    }
+}
+
 DirectXBackendInit initDirectXBackend(int width, int height, bool isTest) {
     dxTrace("initDirectXBackend.loadSDL");
     auto support = loadSDL();
@@ -3039,7 +3091,7 @@ DirectXBackendInit initDirectXBackend(int width, int height, bool isTest) {
 
     int drawableW = width;
     int drawableH = height;
-    SDL_GetWindowSize(window, &drawableW, &drawableH);
+    queryWindowPixelSize(window, drawableW, drawableH);
 
     dxTrace("initDirectXBackend.new RenderingBackend");
     auto backend = new RenderingBackend(window);
