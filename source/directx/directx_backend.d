@@ -89,6 +89,9 @@ enum StencilMode : ubyte {
 }
 
 enum uint D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING_VALUE = 5768;
+enum HRESULT DXGI_ERROR_DEVICE_HUNG_HR = cast(HRESULT)0x887A0006u;
+enum HRESULT DXGI_ERROR_DEVICE_REMOVED_HR = cast(HRESULT)0x887A0005u;
+enum HRESULT DXGI_ERROR_DEVICE_RESET_HR = cast(HRESULT)0x887A0007u;
 
 bool dxSucceeded(HRESULT hr) @safe pure nothrow {
     return hr >= 0;
@@ -96,6 +99,12 @@ bool dxSucceeded(HRESULT hr) @safe pure nothrow {
 
 bool dxFailed(HRESULT hr) @safe pure nothrow {
     return hr < 0;
+}
+
+bool isDeviceLossHr(HRESULT hr) @safe pure nothrow {
+    return hr == DXGI_ERROR_DEVICE_REMOVED_HR ||
+           hr == DXGI_ERROR_DEVICE_RESET_HR ||
+           hr == DXGI_ERROR_DEVICE_HUNG_HR;
 }
 
 bool isDxTraceEnabled() {
@@ -177,6 +186,7 @@ alias PuppetHandle = void*;
 // Keep in sync with nijilive/source/nijilive/integration/unity.d
 enum NjgRenderCommandKind : uint {
     DrawPart,
+    DrawMask,
     BeginDynamicComposite,
     EndDynamicComposite,
     BeginMask,
@@ -370,6 +380,10 @@ public:
 
     void dispose() {
         pixels_.length = 0;
+        invalidateGpuObjects();
+    }
+
+    void invalidateGpuObjects() {
         gpuTexture = null;
         gpuUpload = null;
         gpuUploadCapacity = 0;
@@ -490,6 +504,9 @@ private:
         size_t uploadedVertexBytes = 0;
         size_t uploadedIndexBytes = 0;
         uint srvDescriptorSize = 0;
+        uint srvDescriptorCapacity = 0;
+        uint offscreenRtvDescriptorCapacity = 0;
+        uint offscreenRtvCursor = 0;
         D3D12_VERTEX_BUFFER_VIEW vbView = D3D12_VERTEX_BUFFER_VIEW.init;
         D3D12_INDEX_BUFFER_VIEW ibView = D3D12_INDEX_BUFFER_VIEW.init;
         uint rtvDescriptorSize = 0;
@@ -504,6 +521,11 @@ private:
         size_t srvHeapCpuStartPtr = 0;
         ulong srvHeapGpuStartPtr = 0;
         bool initialized;
+        bool debugLayerEnabled;
+        bool deviceResetOccurred;
+        bool recoveryPending;
+        uint recoveryRetryFrames;
+        uint recoveryAttempt;
 
         static D3D12_CPU_DESCRIPTOR_HANDLE descriptorHeapCpuStart(ID3D12DescriptorHeap heap) {
             D3D12_CPU_DESCRIPTOR_HANDLE h = D3D12_CPU_DESCRIPTOR_HANDLE.init;
@@ -553,6 +575,12 @@ private:
             h.ptr = offscreenRtvHeapCpuStartPtr;
             return h;
         }
+        D3D12_CPU_DESCRIPTOR_HANDLE offscreenRtvHandleAt(uint index) {
+            D3D12_CPU_DESCRIPTOR_HANDLE h = D3D12_CPU_DESCRIPTOR_HANDLE.init;
+            h.ptr = offscreenRtvHeapCpuStartPtr;
+            h.ptr += cast(size_t)(index * rtvDescriptorSize);
+            return h;
+        }
 
         D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle() {
             D3D12_CPU_DESCRIPTOR_HANDLE h = D3D12_CPU_DESCRIPTOR_HANDLE.init;
@@ -565,6 +593,12 @@ private:
             h.ptr = dsvHeapCpuStartPtr;
             h.ptr += cast(size_t)dsvDescriptorSize;
             return h;
+        }
+
+        void releaseDxResource(ref DXPtr!ID3D12Resource resource) {
+            if (resource is null) return;
+            resource.opAssign(cast(ID3D12Resource)null);
+            resource = null;
         }
 
         static BlendMode sanitizeBlendMode(int rawMode) {
@@ -704,7 +738,7 @@ private:
 
         void releaseRenderTargets() {
             foreach (i; 0 .. FrameCount) {
-                renderTargets[i] = null;
+                releaseDxResource(renderTargets[i]);
             }
         }
 
@@ -826,9 +860,10 @@ private:
             rtvHeapCpuStartPtr = descriptorHeapCpuStart(rtvHeapPtr.value).ptr;
             dxTrace("createSwapChainAndTargets.afterCreateRTVHeap");
 
+            enum uint kOffscreenRtvDescriptors = 8192;
             D3D12_DESCRIPTOR_HEAP_DESC offscreenRtvDesc = D3D12_DESCRIPTOR_HEAP_DESC.init;
             offscreenRtvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE.RTV;
-            offscreenRtvDesc.NumDescriptors = 3;
+            offscreenRtvDesc.NumDescriptors = kOffscreenRtvDescriptors;
             offscreenRtvDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAGS.NONE;
             offscreenRtvDesc.NodeMask = 0;
             ID3D12DescriptorHeap rawOffscreenRtv = null;
@@ -840,6 +875,8 @@ private:
                 "CreateDescriptorHeap(Offscreen RTV) failed");
             offscreenRtvHeapPtr = new DXPtr!ID3D12DescriptorHeap(rawOffscreenRtv);
             offscreenRtvHeapCpuStartPtr = descriptorHeapCpuStart(offscreenRtvHeapPtr.value).ptr;
+            offscreenRtvDescriptorCapacity = kOffscreenRtvDescriptors;
+            offscreenRtvCursor = 0;
             dxTrace("createSwapChainAndTargets.afterCreateOffscreenRTVHeap");
 
             D3D12_DESCRIPTOR_HEAP_DESC dsvDesc = D3D12_DESCRIPTOR_HEAP_DESC.init;
@@ -869,7 +906,7 @@ private:
 
         void createDepthStencilTarget(int w, int h) {
             dxTrace("createDepthStencilTarget.begin w=" ~ to!string(w) ~ " h=" ~ to!string(h));
-            depthStencil = null;
+            releaseDxResource(depthStencil);
             D3D12_HEAP_PROPERTIES heapProps = D3D12_HEAP_PROPERTIES.init;
             heapProps.Type = D3D12_HEAP_TYPE.DEFAULT;
             heapProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY.UNKNOWN;
@@ -922,12 +959,16 @@ private:
         bool ensureOffscreenDepthStencilTarget(int w, int h) {
             auto targetW = max(1, w);
             auto targetH = max(1, h);
-            bool recreate = offscreenDepthStencil is null || offscreenDsvW != targetW || offscreenDsvH != targetH;
+            bool recreate = offscreenDepthStencil is null;
             if (!recreate) return true;
 
-            offscreenDepthStencil = null;
-            offscreenDsvW = targetW;
-            offscreenDsvH = targetH;
+            releaseDxResource(offscreenDepthStencil);
+            // Keep one offscreen DSV resource for the runtime lifetime.
+            // Rewriting the same DSV descriptor within a command list can invalidate earlier draws.
+            offscreenDsvW = max(1, viewportW);
+            offscreenDsvH = max(1, viewportH);
+            if (offscreenDsvW < targetW) offscreenDsvW = targetW;
+            if (offscreenDsvH < targetH) offscreenDsvH = targetH;
 
             D3D12_HEAP_PROPERTIES heapProps = D3D12_HEAP_PROPERTIES.init;
             heapProps.Type = D3D12_HEAP_TYPE.DEFAULT;
@@ -939,8 +980,8 @@ private:
             D3D12_RESOURCE_DESC dsDesc = D3D12_RESOURCE_DESC.init;
             dsDesc.Dimension = D3D12_RESOURCE_DIMENSION.TEXTURE2D;
             dsDesc.Alignment = 0;
-            dsDesc.Width = cast(uint)targetW;
-            dsDesc.Height = cast(uint)targetH;
+            dsDesc.Width = cast(uint)offscreenDsvW;
+            dsDesc.Height = cast(uint)offscreenDsvH;
             dsDesc.DepthOrArraySize = 1;
             dsDesc.MipLevels = 1;
             dsDesc.Format = DXGI_FORMAT.D24_UNORM_S8_UINT;
@@ -981,9 +1022,10 @@ private:
         }
 
         void createSrvResources() {
+            enum uint kSrvDescriptorCapacity = 32768;
             D3D12_DESCRIPTOR_HEAP_DESC heapDesc = D3D12_DESCRIPTOR_HEAP_DESC.init;
             heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE.CBV_SRV_UAV;
-            heapDesc.NumDescriptors = 3;
+            heapDesc.NumDescriptors = kSrvDescriptorCapacity;
             heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAGS.SHADER_VISIBLE;
             heapDesc.NodeMask = 0;
             ID3D12DescriptorHeap rawHeap = null;
@@ -994,11 +1036,12 @@ private:
                 "CreateDescriptorHeap(CBV_SRV_UAV) failed");
             srvHeapPtr = new DXPtr!ID3D12DescriptorHeap(rawHeap);
             srvDescriptorSize = devicePtr.value.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE.CBV_SRV_UAV);
+            srvDescriptorCapacity = kSrvDescriptorCapacity;
             srvHeapCpuStartPtr = descriptorHeapCpuStart(srvHeapPtr.value).ptr;
             srvHeapGpuStartPtr = descriptorHeapGpuStart(srvHeapPtr.value);
         }
 
-        void updateHeapSrvTexture2D(ID3D12Resource resource, uint slot) {
+        void updateHeapSrvTexture2D(ID3D12Resource resource, uint descriptorIndex) {
             if (srvHeapPtr is null) return;
             D3D12_SHADER_RESOURCE_VIEW_DESC view = D3D12_SHADER_RESOURCE_VIEW_DESC.init;
             view.Format = DXGI_FORMAT.R8G8B8A8_UNORM;
@@ -1010,7 +1053,7 @@ private:
             view.Texture2D.ResourceMinLODClamp = 0;
             D3D12_CPU_DESCRIPTOR_HANDLE cpu = D3D12_CPU_DESCRIPTOR_HANDLE.init;
             cpu.ptr = srvHeapCpuStartPtr;
-            cpu.ptr += cast(size_t)(slot * srvDescriptorSize);
+            cpu.ptr += cast(size_t)(descriptorIndex * srvDescriptorSize);
             devicePtr.value.CreateShaderResourceView(resource, &view, cpu);
         }
 
@@ -1166,14 +1209,65 @@ private:
             tex.gpuDirty = false;
         }
 
-        void waitForGpu() {
-            if (!initialized) return;
+        bool waitForGpu() {
+            if (!initialized) return true;
             fenceValue++;
-            queuePtr.value.Signal(fencePtr.value, fenceValue);
+            auto signalHr = queuePtr.value.Signal(fencePtr.value, fenceValue);
+            if (dxFailed(signalHr)) {
+                if (isDxTraceEnabled()) {
+                    dxTrace("waitForGpu: Signal failed hr=" ~ to!string(cast(uint)signalHr));
+                }
+                return false;
+            }
             if (fencePtr.value.GetCompletedValue() < fenceValue) {
-                fencePtr.value.SetEventOnCompletion(fenceValue, fenceEvent);
+                auto eventHr = fencePtr.value.SetEventOnCompletion(fenceValue, fenceEvent);
+                if (dxFailed(eventHr)) {
+                    if (isDxTraceEnabled()) {
+                        dxTrace("waitForGpu: SetEventOnCompletion failed hr=" ~ to!string(cast(uint)eventHr));
+                    }
+                    return false;
+                }
                 WaitForSingleObject(fenceEvent, INFINITE);
             }
+            return true;
+        }
+
+        void recoverFromDeviceLoss(HRESULT presentHr) {
+            HRESULT reason = presentHr;
+            if (devicePtr !is null) {
+                reason = devicePtr.value.GetDeviceRemovedReason();
+            }
+            if (isDxTraceEnabled()) {
+                dxTrace("recoverFromDeviceLoss: presentHr=" ~ to!string(cast(uint)presentHr) ~
+                    " reason=" ~ to!string(cast(uint)reason));
+            }
+
+            auto hwndLocal = hwnd;
+            auto w = max(1, viewportW);
+            auto h = max(1, viewportH);
+            auto useDebugLayer = debugLayerEnabled;
+
+            shutdown(false);
+            deviceResetOccurred = true;
+            recoveryPending = true;
+            recoveryAttempt++;
+            auto delay = cast(uint)(30 * recoveryAttempt);
+            if (delay > 300) delay = 300;
+            recoveryRetryFrames = delay;
+            if (isDxTraceEnabled()) {
+                dxTrace("recoverFromDeviceLoss: schedule retry in frames=" ~ to!string(recoveryRetryFrames));
+            }
+            // Keep these cached for deferred recovery attempts.
+            this.hwnd = hwndLocal;
+            this.viewportW = w;
+            this.viewportH = h;
+            this.debugLayerEnabled = useDebugLayer;
+        }
+
+        bool consumeDeviceResetFlag() {
+            bool value = deviceResetOccurred;
+            deviceResetOccurred = false;
+            return value;
         }
 
         void resizeSwapChain(int w, int h) {
@@ -1182,6 +1276,17 @@ private:
             if (viewportW == w && viewportH == h) return;
 
             waitForGpu();
+            // Ensure the command list drops any references to old back buffers
+            // before calling ResizeBuffers.
+            if (allocatorPtr !is null && commandListPtr !is null) {
+                auto allocResetHr = allocatorPtr.value.Reset();
+                if (dxSucceeded(allocResetHr)) {
+                    auto listResetHr = commandListPtr.value.Reset(allocatorPtr.value, null);
+                    if (dxSucceeded(listResetHr)) {
+                        commandListPtr.value.Close();
+                    }
+                }
+            }
             viewportW = w;
             viewportH = h;
             releaseRenderTargets();
@@ -1196,7 +1301,7 @@ private:
 
             createRenderTargets();
             createDepthStencilTarget(w, h);
-            offscreenDepthStencil = null;
+            releaseDxResource(offscreenDepthStencil);
             offscreenDsvW = 0;
             offscreenDsvH = 0;
         }
@@ -1673,6 +1778,7 @@ float4 psMain(VSOutput input) : SV_TARGET {
         }
 
         void uploadGeometry(const(Vertex)[] vertices, const(ushort)[] indices) {
+            if (!initialized) return;
             auto vBytes = cast(size_t)(vertices.length * Vertex.sizeof);
             auto iBytes = cast(size_t)(indices.length * ushort.sizeof);
 
@@ -1739,29 +1845,50 @@ float4 psMain(VSOutput input) : SV_TARGET {
             };
 
             bool currentTargetHasStencil = true;
-            auto bindTextureTargets = (Texture[3] targets, uint targetCount, bool clearTarget) {
-                if (targetCount == 0) return;
+            auto bindTextureTargets = (Texture[3] targets, uint targetCount, bool clearTarget, ref Texture[3] boundTargets) {
+                boundTargets[] = null;
+                if (targetCount == 0) return cast(uint)0;
                 if (targetCount > 3) targetCount = 3;
                 auto primary = targets[0];
-                if (primary is null || !primary.renderTarget) return;
+                if (primary is null || !primary.renderTarget) return cast(uint)0;
 
-                uint boundCount = targetCount;
-                if (boundCount < 1) boundCount = 1;
-                if (boundCount > 3) boundCount = 3;
-
-                D3D12_CPU_DESCRIPTOR_HANDLE[3] rtvs;
-                foreach (i; 0 .. boundCount) {
+                Texture[3] uniqueTargets;
+                uint uniqueCount = 0;
+                foreach (i; 0 .. targetCount) {
                     Texture target = targets[i];
                     if (target is null || !target.renderTarget) {
                         target = primary;
                     }
+                    bool duplicate = false;
+                    foreach (j; 0 .. uniqueCount) {
+                        if (uniqueTargets[j] is target) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (!duplicate && uniqueCount < 3) {
+                        uniqueTargets[uniqueCount++] = target;
+                    }
+                }
+                if (uniqueCount == 0 || offscreenRtvHeapPtr is null) return cast(uint)0;
+
+                if (offscreenRtvCursor > offscreenRtvDescriptorCapacity ||
+                    uniqueCount > offscreenRtvDescriptorCapacity - offscreenRtvCursor) {
+                    return cast(uint)0;
+                }
+                auto rtvBase = offscreenRtvCursor;
+                offscreenRtvCursor += uniqueCount;
+
+                D3D12_CPU_DESCRIPTOR_HANDLE[3] rtvs;
+                foreach (i; 0 .. uniqueCount) {
+                    auto target = uniqueTargets[i];
                     ensureTextureUploaded(target);
-                    if (target.gpuTexture is null || offscreenRtvHeapPtr is null) return;
+                    if (target.gpuTexture is null) return cast(uint)0;
                     transitionTextureState(target, D3D12_RESOURCE_STATES.RENDER_TARGET);
-                    auto rtv = offscreenRtvHandle();
-                    rtv.ptr += cast(size_t)(i * rtvDescriptorSize);
+                    auto rtv = offscreenRtvHandleAt(rtvBase + i);
                     devicePtr.value.CreateRenderTargetView(target.gpuTexture.value, null, rtv);
                     rtvs[i] = rtv;
+                    boundTargets[i] = target;
                 }
 
                 D3D12_VIEWPORT vp = D3D12_VIEWPORT.init;
@@ -1781,23 +1908,26 @@ float4 psMain(VSOutput input) : SV_TARGET {
                 commandListPtr.value.RSSetScissorRects(1, &scissor);
                 if (ensureOffscreenDepthStencilTarget(primary.width, primary.height)) {
                     auto dsv = offscreenDsvHandle();
-                    commandListPtr.value.OMSetRenderTargets(boundCount, rtvs.ptr, true, &dsv);
+                    commandListPtr.value.OMSetRenderTargets(uniqueCount, rtvs.ptr, true, &dsv);
                     currentTargetHasStencil = true;
                 } else {
-                    commandListPtr.value.OMSetRenderTargets(boundCount, rtvs.ptr, true, null);
+                    commandListPtr.value.OMSetRenderTargets(uniqueCount, rtvs.ptr, true, null);
                     currentTargetHasStencil = false;
                 }
                 if (clearTarget) {
                     const(float)[4] clearColor = [0.0f, 0.0f, 0.0f, 0.0f];
-                    foreach (i; 0 .. boundCount) {
+                    foreach (i; 0 .. uniqueCount) {
                         commandListPtr.value.ClearRenderTargetView(rtvs[i], clearColor.ptr, 0, null);
                     }
                 }
+                return uniqueCount;
             };
 
             Texture[3] currentTargets;
             uint currentTargetCount = 0;
             size_t spanIndex = 0;
+            uint srvDescriptorCursor = 0;
+            bool srvHeapOverflowWarned = false;
             bindBackbufferTarget();
             currentTargetHasStencil = true;
             foreach (span; spans) {
@@ -1834,11 +1964,35 @@ float4 psMain(VSOutput input) : SV_TARGET {
                         bindBackbufferTarget();
                         currentTargetHasStencil = true;
                     } else {
-                        bindTextureTargets(currentTargets, currentTargetCount, span.clearRenderTarget);
+                        Texture[3] normalizedTargets;
+                        auto normalizedCount = bindTextureTargets(
+                            currentTargets, currentTargetCount, span.clearRenderTarget, normalizedTargets);
+                        if (normalizedCount == 0) {
+                            currentTargetCount = 0;
+                            currentTargets[] = null;
+                            bindBackbufferTarget();
+                            currentTargetHasStencil = true;
+                        } else {
+                            currentTargetCount = normalizedCount;
+                            currentTargets = normalizedTargets;
+                        }
                     }
                 }
                 auto tex0 = span.textures[0];
                 if (tex0 is null || tex0.pixelCount == 0) continue;
+
+                // Each draw needs its own SRV table. Reusing the same slots causes all draws
+                // to sample whichever texture was written last once GPU executes the command list.
+                uint descriptorBase = 0;
+                bool descriptorSliceValid = (srvDescriptorCapacity >= 3 &&
+                    srvDescriptorCursor <= srvDescriptorCapacity - 3);
+                if (descriptorSliceValid) {
+                    descriptorBase = srvDescriptorCursor;
+                    srvDescriptorCursor += 3;
+                } else if (!srvHeapOverflowWarned && isDxTraceEnabled()) {
+                    dxTrace("drawUploadedGeometry: SRV heap capacity exhausted; reusing descriptor base 0");
+                    srvHeapOverflowWarned = true;
+                }
 
                 foreach (slot; 0 .. 3) {
                     Texture t = null;
@@ -1891,7 +2045,7 @@ float4 psMain(VSOutput input) : SV_TARGET {
                             " span=" ~ to!string(spanIndex) ~
                             " beforeUpdateSrv");
                     }
-                    updateHeapSrvTexture2D(t.gpuTexture.value, cast(uint)slot);
+                    updateHeapSrvTexture2D(t.gpuTexture.value, descriptorBase + cast(uint)slot);
                     if (traceTexOps) {
                         dxTrace("drawUploadedGeometry.tex slot=" ~ to!string(slot) ~
                             " span=" ~ to!string(spanIndex) ~
@@ -1900,6 +2054,7 @@ float4 psMain(VSOutput input) : SV_TARGET {
                 }
                 D3D12_GPU_DESCRIPTOR_HANDLE gpuSrv = D3D12_GPU_DESCRIPTOR_HANDLE.init;
                 gpuSrv.ptr = srvHeapGpuStartPtr;
+                gpuSrv.ptr += cast(ulong)(descriptorBase * srvDescriptorSize);
                 commandListPtr.value.SetGraphicsRootDescriptorTable(0, gpuSrv);
                 float[16] drawParams;
                 drawParams[0] = span.useMultistageBlend ? 1.0f : 0.0f;
@@ -2020,6 +2175,11 @@ float4 psMain(VSOutput input) : SV_TARGET {
             this.hwnd = hwnd;
             this.viewportW = viewportW;
             this.viewportH = viewportH;
+            this.debugLayerEnabled = debugLayer;
+            this.deviceResetOccurred = false;
+            this.recoveryPending = false;
+            this.recoveryRetryFrames = 0;
+            this.recoveryAttempt = 0;
             dxTrace("DirectXRuntime.initialize.skipCoInit");
 
             if (debugLayer) {
@@ -2161,11 +2321,37 @@ float4 psMain(VSOutput input) : SV_TARGET {
         }
 
         void beginFrame() {
-            if (!initialized) return;
+            if (!initialized) {
+                if (!recoveryPending) return;
+                if (recoveryRetryFrames > 0) {
+                    recoveryRetryFrames--;
+                    return;
+                }
+                try {
+                    initialize(hwnd, max(1, viewportW), max(1, viewportH), debugLayerEnabled);
+                    deviceResetOccurred = true;
+                    if (isDxTraceEnabled()) {
+                        dxTrace("beginFrame: deferred device recovery succeeded");
+                    }
+                } catch (Throwable) {
+                    shutdown(false);
+                    recoveryPending = true;
+                    recoveryAttempt++;
+                    auto delay = cast(uint)(30 * recoveryAttempt);
+                    if (delay > 300) delay = 300;
+                    recoveryRetryFrames = delay;
+                    if (isDxTraceEnabled()) {
+                        dxTrace("beginFrame: deferred device recovery failed; retry in frames=" ~ to!string(recoveryRetryFrames));
+                    }
+                    return;
+                }
+                if (!initialized) return;
+            }
             if (isDxTraceEnabled()) {
                 dxTrace("beginFrame.beforeReset allocator=" ~ to!string(cast(size_t)cast(void*)allocatorPtr.value) ~
                     " cmdList=" ~ to!string(cast(size_t)cast(void*)commandListPtr.value));
             }
+            offscreenRtvCursor = 0;
             enforceHr(allocatorPtr.value.Reset(), "CommandAllocator.Reset failed");
             dxTrace("beginFrame.afterResetAllocator");
             enforceHr(commandListPtr.value.Reset(allocatorPtr.value, null), "CommandList.Reset failed");
@@ -2225,16 +2411,33 @@ float4 psMain(VSOutput input) : SV_TARGET {
             queuePtr.value.ExecuteCommandLists(1, cast(const(ID3D12CommandList)*)lists.ptr);
 
             if (doPresent && swapChainPtr !is null) {
-                enforceHr(swapChainPtr.value.Present(1, 0), "IDXGISwapChain3.Present failed");
+                auto presentHr = swapChainPtr.value.Present(1, 0);
+                if (dxFailed(presentHr)) {
+                    if (isDeviceLossHr(presentHr)) {
+                        recoverFromDeviceLoss(presentHr);
+                        return;
+                    }
+                    enforceHr(presentHr, "IDXGISwapChain3.Present failed");
+                }
             }
 
-            waitForGpu();
+            if (!waitForGpu()) {
+                recoverFromDeviceLoss(DXGI_ERROR_DEVICE_REMOVED_HR);
+                return;
+            }
         }
 
-        void shutdown() {
-            if (!initialized) return;
-            waitForGpu();
-            releaseRenderTargets();
+        void shutdown(bool waitForIdle = true) {
+            if (waitForIdle && initialized) {
+                waitForGpu();
+            }
+            if (initialized) {
+                releaseRenderTargets();
+            } else {
+                foreach (i; 0 .. FrameCount) {
+                    renderTargets[i] = null;
+                }
+            }
             vertexUploadBuffer = null;
             indexUploadBuffer = null;
             vertexUploadCapacity = 0;
@@ -2243,11 +2446,14 @@ float4 psMain(VSOutput input) : SV_TARGET {
             uploadedIndexBytes = 0;
             srvHeapPtr = null;
             srvDescriptorSize = 0;
+            srvDescriptorCapacity = 0;
             rtvHeapCpuStartPtr = 0;
             offscreenRtvHeapCpuStartPtr = 0;
             dsvHeapCpuStartPtr = 0;
             srvHeapCpuStartPtr = 0;
             srvHeapGpuStartPtr = 0;
+            offscreenRtvDescriptorCapacity = 0;
+            offscreenRtvCursor = 0;
             foreach (i; 0 .. pipelineStates.length) {
                 pipelineStates[i] = null;
                 pipelineStatesStencilTest[i] = null;
@@ -2768,6 +2974,16 @@ public:
         }
         dxTrace("endScene.endFrame");
         dx.endFrame(!skipPresent);
+        if (dx.consumeDeviceResetFlag()) {
+            foreach (k, tex; gTextures) {
+                if (tex !is null) {
+                    tex.invalidateGpuObjects();
+                }
+            }
+            if (maskFallbackTexture !is null) {
+                maskFallbackTexture.invalidateGpuObjects();
+            }
+        }
         frameSeq++;
         if (frameSeq % 60 == 0) {
             writeln("[directx] frame=", frameSeq,
@@ -2877,6 +3093,9 @@ void renderCommands(const DirectXBackendInit* dx,
         switch (kind) {
             case cast(uint)NjgRenderCommandKind.DrawPart:
                 backend.drawPartPacket(cmd.partPacket, gTextures);
+                break;
+            case cast(uint)NjgRenderCommandKind.DrawMask:
+                backend.drawMaskPacket(cmd.maskApplyPacket.maskPacket);
                 break;
             case cast(uint)NjgRenderCommandKind.BeginDynamicComposite:
                 backend.beginDynamicComposite(cmd.dynamicPass);
