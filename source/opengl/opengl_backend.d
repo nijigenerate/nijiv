@@ -192,8 +192,10 @@ struct MaskApplyPacket {
 
 class DynamicCompositeSurface {
     Texture[3] textures;
+    size_t[3] textureHandles;
     size_t textureCount;
     Texture stencil;
+    size_t stencilHandle;
     RenderResourceHandle framebuffer;
 }
 
@@ -1279,9 +1281,11 @@ void main() {
         }
 
         if (surface.framebuffer == 0) {
-            GLuint newFramebuffer;
-            glGenFramebuffers(1, &newFramebuffer);
-            surface.framebuffer = cast(RenderResourceHandle)newFramebuffer;
+            surface.framebuffer = acquireDynamicFramebuffer(
+                surface.textureHandles,
+                surface.textureCount,
+                surface.stencilHandle
+            );
         }
 
         GLint previousFramebuffer;
@@ -2224,12 +2228,14 @@ private:
         auto surface = new DynamicCompositeSurface;
         surface.textureCount = min(packet.textureCount, packet.textures.length);
         foreach (i; 0 .. surface.textureCount) {
+            surface.textureHandles[i] = packet.textures[i];
             if (auto tex = packet.textures[i] in texturesByHandle) {
                 surface.textures[i] = *tex;
             } else {
                 surface.textures[i] = null;
             }
         }
+        surface.stencilHandle = packet.stencil;
         if (auto stencil = packet.stencil in texturesByHandle) {
             surface.stencil = *stencil;
         } else {
@@ -2383,7 +2389,83 @@ struct OpenGLBackendInit {
 __gshared Texture[size_t] gTextures; // Unity handle -> nlshim Texture
 __gshared size_t gNextHandle = 1;
 __gshared bool gBackendInitialized;
+__gshared RenderResourceHandle[DynamicCompositeFramebufferKey] gDynamicFramebufferCache;
 // SDL preview window for texture bytes has been removed to avoid interference.
+
+private struct DynamicCompositeFramebufferKey {
+    size_t[3] textures;
+    size_t textureCount;
+    size_t stencil;
+
+    bool opEquals(const typeof(this) rhs) const {
+        return textureCount == rhs.textureCount &&
+            stencil == rhs.stencil &&
+            textures == rhs.textures;
+    }
+
+    size_t toHash() const @safe nothrow {
+        size_t h = 1469598103934665603UL;
+        static foreach (i; 0 .. 3) {
+            h = (h ^ textures[i]) * 1099511628211UL;
+        }
+        h = (h ^ textureCount) * 1099511628211UL;
+        h = (h ^ stencil) * 1099511628211UL;
+        return h;
+    }
+}
+
+private DynamicCompositeFramebufferKey makeDynamicFramebufferKey(const size_t[3] textures,
+                                                                 size_t textureCount,
+                                                                 size_t stencil) {
+    DynamicCompositeFramebufferKey key;
+    key.textures = textures;
+    key.textureCount = textureCount;
+    key.stencil = stencil;
+    return key;
+}
+
+private bool dynamicFramebufferKeyUsesHandle(ref const(DynamicCompositeFramebufferKey) key, size_t handle) {
+    if (handle == 0) return false;
+    if (key.stencil == handle) return true;
+    foreach (i; 0 .. key.textureCount) {
+        if (key.textures[i] == handle) return true;
+    }
+    return false;
+}
+
+private RenderResourceHandle acquireDynamicFramebuffer(const size_t[3] textures,
+                                                       size_t textureCount,
+                                                       size_t stencil) {
+    auto key = makeDynamicFramebufferKey(textures, textureCount, stencil);
+    if (auto cached = key in gDynamicFramebufferCache) {
+        return *cached;
+    }
+
+    GLuint fbo = 0;
+    glGenFramebuffers(1, &fbo);
+    auto handle = cast(RenderResourceHandle)fbo;
+    gDynamicFramebufferCache[key] = handle;
+    return handle;
+}
+
+private void releaseDynamicFramebuffersForTextureHandle(size_t handle) {
+    if (handle == 0 || gDynamicFramebufferCache.length == 0) return;
+
+    DynamicCompositeFramebufferKey[] stale;
+    foreach (key, fboHandle; gDynamicFramebufferCache) {
+        if (dynamicFramebufferKeyUsesHandle(key, handle)) {
+            if (fboHandle != 0) {
+                auto fbo = cast(GLuint)fboHandle;
+                glDeleteFramebuffers(1, &fbo);
+            }
+            stale ~= key;
+        }
+    }
+
+    foreach (key; stale) {
+        gDynamicFramebufferCache.remove(key);
+    }
+}
 
 string sdlError() {
     auto err = SDL_GetError();
@@ -2475,6 +2557,8 @@ OpenGLBackendInit initOpenGLBackend(int width, int height, bool isTest) {
         (*tex).setData(slice, channels);
     };
     cbs.releaseTexture = (size_t handle, void* userData) {
+        // Drop all cached dynamic-composite FBOs that reference this texture handle.
+        releaseDynamicFramebuffersForTextureHandle(handle);
         if (auto tex = handle in gTextures) {
             if (*tex !is null) (*tex).dispose();
             gTextures.remove(handle);
