@@ -85,7 +85,6 @@ alias PuppetHandle = void*;
 
 enum NjgRenderCommandKind : uint {
     DrawPart,
-    DrawMask,
     BeginDynamicComposite,
     EndDynamicComposite,
     BeginMask,
@@ -127,6 +126,7 @@ extern(C) struct NjgPartDrawPacket {
     size_t uvAtlasStride;
     size_t deformOffset;
     size_t deformAtlasStride;
+    size_t indexHandle;
     const(ushort)* indices;
     size_t indexCount;
     size_t vertexCount;
@@ -140,6 +140,7 @@ extern(C) struct NjgMaskDrawPacket {
     size_t vertexAtlasStride;
     size_t deformOffset;
     size_t deformAtlasStride;
+    size_t indexHandle;
     const(ushort)* indices;
     size_t indexCount;
     size_t vertexCount;
@@ -3058,8 +3059,6 @@ void renderCommands(const VulkanBackendInit* vk,
         final switch (cmd.kind) {
             case NjgRenderCommandKind.DrawPart:
                 backend.drawPartPacket(cmd.partPacket);
-                break;
-            case NjgRenderCommandKind.DrawMask:
                 break;
             case NjgRenderCommandKind.BeginDynamicComposite:
                 backend.beginDynamicComposite(cmd.dynamicPass);

@@ -218,9 +218,11 @@ enum ToggleOption {
 struct CliOptions {
     bool isTest = false;
     int framesFlag = -1;
+    string unityDllFlavor;
     ToggleOption transparentWindow = ToggleOption.Unspecified;
     ToggleOption transparentRetry = ToggleOption.Unspecified;
     ToggleOption transparentDebug = ToggleOption.Unspecified;
+    string queueDumpPath;
     string[] positional;
 }
 
@@ -299,6 +301,16 @@ private CliOptions parseCliOptions(string[] args) {
             }
             continue;
         }
+        if (arg == "--unity-dll") {
+            if (i + 1 < args.length) {
+                auto flavor = args[i + 1].toLower();
+                if (flavor == "nijilive" || flavor == "nicxlive") {
+                    out_.unityDllFlavor = flavor;
+                }
+                ++i;
+            }
+            continue;
+        }
         if (arg == "--transparent-window") {
             out_.transparentWindow = ToggleOption.Enabled;
             continue;
@@ -323,9 +335,107 @@ private CliOptions parseCliOptions(string[] args) {
             out_.transparentDebug = ToggleOption.Disabled;
             continue;
         }
+        if (arg == "--queue-dump") {
+            if (i + 1 < args.length) {
+                out_.queueDumpPath = args[i + 1];
+                ++i;
+            }
+            continue;
+        }
         out_.positional ~= arg;
     }
     return out_;
+}
+
+private string commandKindName(gfx.NjgRenderCommandKind kind) {
+    switch (kind) {
+        case gfx.NjgRenderCommandKind.DrawPart: return "DrawPart";
+        case gfx.NjgRenderCommandKind.BeginDynamicComposite: return "BeginDynamicComposite";
+        case gfx.NjgRenderCommandKind.EndDynamicComposite: return "EndDynamicComposite";
+        case gfx.NjgRenderCommandKind.BeginMask: return "BeginMask";
+        case gfx.NjgRenderCommandKind.ApplyMask: return "ApplyMask";
+        case gfx.NjgRenderCommandKind.BeginMaskContent: return "BeginMaskContent";
+        case gfx.NjgRenderCommandKind.EndMask: return "EndMask";
+        default: return "Unknown(" ~ to!string(cast(uint)kind) ~ ")";
+    }
+}
+
+private ulong hashFloatSlice(const(float)* ptr, size_t len) {
+    ulong h = 1469598103934665603UL;
+    if (ptr is null) return h;
+    foreach (i; 0 .. len) {
+        auto bits = *cast(const(uint)*)(&ptr[i]);
+        h ^= cast(ulong)bits;
+        h *= 1099511628211UL;
+    }
+    return h;
+}
+
+private void dumpQueueFrame(string path, string dllFlavor, int frameIndex,
+                            const gfx.SharedBufferSnapshot* snapshot,
+                            const gfx.CommandQueueView* view) {
+    import std.format : format;
+    import std.stdio : File;
+
+    if (path.length == 0 || snapshot is null || view is null) return;
+    if (frameIndex == 0) {
+        File(path, "w").close();
+    }
+
+    const auto vhash = hashFloatSlice(snapshot.vertices.data, snapshot.vertices.length);
+    const auto uhash = hashFloatSlice(snapshot.uvs.data, snapshot.uvs.length);
+    const auto dhash = hashFloatSlice(snapshot.deform.data, snapshot.deform.length);
+    ulong mhDraw = 1469598103934665603UL;
+    ulong mhMask = 1469598103934665603UL;
+
+    string dumpText;
+    dumpText ~= format("DLL_FLAVOR %s\n", dllFlavor);
+    dumpText ~= format("FRAME %s count=%s vertices=%s uvs=%s deform=%s\n",
+        frameIndex, view.count, snapshot.vertexCount, snapshot.uvCount, snapshot.deformCount);
+    dumpText ~= format("HASH v=%s u=%s d=%s\n", vhash, uhash, dhash);
+
+    auto cmds = view.commands[0 .. view.count];
+    foreach (i, cmd; cmds) {
+        dumpText ~= format("CMD %s kind=%s", i, commandKindName(cmd.kind));
+        if (cmd.kind == gfx.NjgRenderCommandKind.DrawPart) {
+            const auto p = cmd.partPacket;
+            mhDraw ^= hashFloatSlice(p.modelMatrix.ptr, 16);
+            mhDraw *= 1099511628211UL;
+            mhDraw ^= hashFloatSlice(p.renderMatrix.ptr, 16);
+            mhDraw *= 1099511628211UL;
+            dumpText ~= format(" vo=%s uo=%s do=%s idx=%s vtx=%s",
+                p.vertexOffset, p.uvOffset, p.deformOffset, p.indexCount, p.vertexCount);
+            if (p.vertexCount > 0 &&
+                p.vertexOffset < snapshot.vertices.length &&
+                p.uvOffset < snapshot.uvs.length &&
+                p.deformOffset < snapshot.deform.length) {
+                const float vx = snapshot.vertices.data[p.vertexOffset];
+                const float vy = (p.vertexOffset + snapshot.vertexCount) < snapshot.vertices.length
+                    ? snapshot.vertices.data[p.vertexOffset + snapshot.vertexCount] : 0.0f;
+                const float ux = snapshot.uvs.data[p.uvOffset];
+                const float uy = (p.uvOffset + snapshot.uvCount) < snapshot.uvs.length
+                    ? snapshot.uvs.data[p.uvOffset + snapshot.uvCount] : 0.0f;
+                const float dx = snapshot.deform.data[p.deformOffset];
+                const float dy = (p.deformOffset + snapshot.deformCount) < snapshot.deform.length
+                    ? snapshot.deform.data[p.deformOffset + snapshot.deformCount] : 0.0f;
+                dumpText ~= format(" sample v0=(%s,%s) uv0=(%s,%s) d0=(%s,%s)", vx, vy, ux, uy, dx, dy);
+            }
+        } else if (cmd.kind == gfx.NjgRenderCommandKind.ApplyMask) {
+            const auto m = cmd.maskApplyPacket;
+            if (m.kind == gfx.MaskDrawableKind.Part) {
+                mhMask ^= hashFloatSlice(m.partPacket.modelMatrix.ptr, 16);
+                mhMask *= 1099511628211UL;
+                mhMask ^= hashFloatSlice(m.partPacket.renderMatrix.ptr, 16);
+                mhMask *= 1099511628211UL;
+            }
+        }
+        dumpText ~= "\n";
+    }
+    dumpText ~= format("HASH_MAT draw=%s mask=%s\n", mhDraw, mhMask);
+    dumpText ~= "\n";
+    auto f = File(path, "a");
+    f.write(dumpText);
+    f.close();
 }
 
 void configureTransparentWindow(SDL_Window* window) {
@@ -636,7 +746,7 @@ void main(string[] args) {
     int testMaxFrames = 5;
     auto testTimeout = 5.seconds;
     if (positional.length < 1) {
-        writeln("Usage: nijiv <puppet.inp|puppet.inx> [width height] [--test] [--transparent-window|--no-transparent-window] [--transparent-window-retry|--no-transparent-window-retry] [--transparent-debug]");
+        writeln("Usage: nijiv <puppet.inp|puppet.inx> [width height] [--test] [--frames N] [--unity-dll nijilive|nicxlive] [--queue-dump PATH] [--transparent-window|--no-transparent-window] [--transparent-window-retry|--no-transparent-window-retry] [--transparent-debug]");
         return;
     }
     string puppetPath = resolvePuppetPath(positional[0]);
@@ -726,15 +836,48 @@ void main(string[] args) {
     }
     bool transparencyRetryPending = canApplyTransparentWindow && transparentWindowRetry;
 
-    // Load the Unity-facing DLL from a nearby nijilive build.
+    // Resolve Unity-facing DLL flavor.
+    string unityFlavor = cli.unityDllFlavor;
+    if (unityFlavor.length == 0) {
+        if (auto p = getenv("NJIV_UNITY_DLL")) {
+            auto envFlavor = fromStringz(p).idup.toLower();
+            if (envFlavor == "nijilive" || envFlavor == "nicxlive") {
+                unityFlavor = envFlavor;
+            }
+        }
+    }
+    if (unityFlavor.length == 0) {
+        unityFlavor = "nicxlive";
+    }
+
+    // Load the Unity-facing DLL from nearby build outputs.
     string exeDir = getcwd();
-    auto libNames = unityLibraryNames();
+    string[] libNames;
+    if (unityFlavor == "nicxlive") {
+        version (Windows) {
+            libNames = ["nicxlive.dll"];
+        } else version (linux) {
+            libNames = ["libnicxlive.so", "nicxlive.so"];
+        } else version (OSX) {
+            libNames = ["libnicxlive.dylib", "nicxlive.dylib"];
+        } else {
+            libNames = ["libnicxlive"];
+        }
+    } else {
+        libNames = unityLibraryNames();
+    }
     string[] libCandidates;
     foreach (name; libNames) {
         libCandidates ~= buildPath(exeDir, name);
-        libCandidates ~= buildPath(exeDir, "..", "nijilive", name);
-        libCandidates ~= buildPath(exeDir, "..", "..", "nijilive", name);
-        libCandidates ~= buildPath("..", "nijilive", name);
+        if (unityFlavor == "nicxlive") {
+            libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "Debug", name);
+            libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "Debug", name);
+            libCandidates ~= buildPath("..", "nicxlive", "build", "Debug", name);
+        } else {
+            libCandidates ~= buildPath(exeDir, "..", "nijilive", name);
+            libCandidates ~= buildPath(exeDir, "..", "..", "nijilive", name);
+            libCandidates ~= buildPath("..", "nijilive", name);
+        }
     }
     string libPath;
     foreach (c; libCandidates) {
@@ -743,7 +886,8 @@ void main(string[] args) {
             break;
         }
     }
-    enforce(libPath.length > 0, "Could not find nijilive unity library (searched: "~libCandidates.to!string~")");
+    enforce(libPath.length > 0, "Could not find unity library for flavor=" ~ unityFlavor ~ " (searched: "~libCandidates.to!string~")");
+    writefln("[unity] flavor=%s path=%s", unityFlavor, libPath);
     auto api = loadUnityApi(libPath);
     // Do not unload the shared runtime-bound DLL during process lifetime.
     if (api.rtInit !is null) api.rtInit();
@@ -897,6 +1041,7 @@ void main(string[] args) {
         enforce(api.emitCommands(renderer, &view) == gfx.NjgResult.Ok, "njgEmitCommands failed");
         gfx.SharedBufferSnapshot snapshot;
         enforce(api.getSharedBuffers(renderer, &snapshot) == gfx.NjgResult.Ok, "njgGetSharedBuffers failed");
+        dumpQueueFrame(cli.queueDumpPath, unityFlavor, frameCount, &snapshot, &view);
 
         gfx.renderCommands(&backendInit, &snapshot, &view);
 
