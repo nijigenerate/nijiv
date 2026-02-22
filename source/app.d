@@ -882,21 +882,21 @@ void main(string[] args) {
     }
     string[] libCandidates;
     foreach (name; libNames) {
-        libCandidates ~= buildPath(exeDir, name);
         if (unityFlavor == "nicxlive") {
-            libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", name);
-            libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", name);
-            libCandidates ~= buildPath("..", "nicxlive", "build", name);
+            libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "Debug", name);
+            libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "Debug", name);
+            libCandidates ~= buildPath("..", "nicxlive", "build", "Debug", name);
             libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "RelWithDebInfo", name);
             libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "RelWithDebInfo", name);
             libCandidates ~= buildPath("..", "nicxlive", "build", "RelWithDebInfo", name);
             libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "Release", name);
             libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "Release", name);
             libCandidates ~= buildPath("..", "nicxlive", "build", "Release", name);
-            libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "Debug", name);
-            libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "Debug", name);
-            libCandidates ~= buildPath("..", "nicxlive", "build", "Debug", name);
+            libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", name);
+            libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", name);
+            libCandidates ~= buildPath("..", "nicxlive", "build", name);
         } else {
+            libCandidates ~= buildPath(exeDir, name);
             libCandidates ~= buildPath(exeDir, "..", "nijilive", name);
             libCandidates ~= buildPath(exeDir, "..", "..", "nijilive", name);
             libCandidates ~= buildPath("..", "nijilive", name);
