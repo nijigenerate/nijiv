@@ -2461,6 +2461,8 @@ struct OpenGLBackendInit {
 }
 
 __gshared Texture[size_t] gTextures; // Unity handle -> nlshim Texture
+__gshared size_t gUnityCreateLogCount = 0;
+__gshared size_t gUnityUpdateLogCount = 0;
 __gshared size_t gNextHandle = 1;
 __gshared bool gBackendInitialized;
 __gshared RenderResourceHandle[DynamicCompositeFramebufferKey] gDynamicFramebufferCache;
@@ -2608,6 +2610,11 @@ OpenGLBackendInit initOpenGLBackend(int width, int height, bool isTest) {
         // Disable mipmaps (min filter is linear-only) to ensure level 0 is displayed.
         auto tex = new Texture(w, h, channels, stencil, false);
         gTextures[handle] = tex;
+        if (gUnityCreateLogCount < 256) {
+            import std.stdio : writefln;
+            writefln("[nijiv][unity-cb] create h=%s w=%s h=%s ch=%s rt=%s st=%s", handle, w, h, channels, renderTarget, stencil);
+            gUnityCreateLogCount++;
+        }
         return handle;
     };
     cbs.updateTexture = (size_t handle, const(ubyte)* data, size_t dataLen, int w, int h, int channels, void* userData) {
@@ -2616,7 +2623,14 @@ OpenGLBackendInit initOpenGLBackend(int width, int height, bool isTest) {
             return;
         }
         size_t expected = cast(size_t)w * cast(size_t)h * cast(size_t)channels;
+        if (gUnityUpdateLogCount < 256) {
+            import std.stdio : writefln;
+            writefln("[nijiv][unity-cb] update h=%s dataLen=%s w=%s h=%s ch=%s expected=%s", handle, dataLen, w, h, channels, expected);
+            gUnityUpdateLogCount++;
+        }
         if (data is null || expected == 0 || dataLen < expected) {
+            import std.stdio : writefln;
+            writefln("[nijiv][unity-cb] skip update h=%s data=%s dataLen=%s expected=%s", handle, data is null ? 0 : 1, dataLen, expected);
             return;
         }
         // Clamp/pad to exactly level0 size so GL upload always gets width*height*channels bytes.

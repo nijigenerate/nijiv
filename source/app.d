@@ -411,11 +411,6 @@ private void dumpQueueFrame(string path, string dllFlavor, int frameIndex,
                 p.blendingMode, p.opacity,
                 p.clampedTint.x, p.clampedTint.y, p.clampedTint.z,
                 p.clampedScreen.x, p.clampedScreen.y, p.clampedScreen.z);
-            if (p.vertexOffset == 916 || p.vertexOffset == 1563 || p.vertexOffset == 1504) {
-                dumpText ~= format(" mm=(%s,%s,%s,%s) rm=(%s,%s,%s,%s)",
-                    p.modelMatrix[0], p.modelMatrix[5], p.modelMatrix[12], p.modelMatrix[13],
-                    p.renderMatrix[0], p.renderMatrix[5], p.renderMatrix[12], p.renderMatrix[13]);
-            }
             if (p.vertexCount > 0 &&
                 p.vertexOffset < snapshot.vertices.length &&
                 p.uvOffset < snapshot.uvs.length &&
