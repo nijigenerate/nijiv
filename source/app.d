@@ -403,8 +403,19 @@ private void dumpQueueFrame(string path, string dllFlavor, int frameIndex,
             mhDraw *= 1099511628211UL;
             mhDraw ^= hashFloatSlice(p.renderMatrix.ptr, 16);
             mhDraw *= 1099511628211UL;
-            dumpText ~= format(" vo=%s uo=%s do=%s idx=%s vtx=%s",
-                p.vertexOffset, p.uvOffset, p.deformOffset, p.indexCount, p.vertexCount);
+            dumpText ~= format(" r=%s m=%s vo=%s uo=%s do=%s idx=%s vtx=%s tc=%s th=(%s,%s,%s)",
+                p.renderable ? 1 : 0, p.isMask ? 1 : 0,
+                p.vertexOffset, p.uvOffset, p.deformOffset, p.indexCount, p.vertexCount, p.textureCount,
+                p.textureHandles[0], p.textureHandles[1], p.textureHandles[2]);
+            dumpText ~= format(" bm=%s op=%s tint=(%s,%s,%s) scr=(%s,%s,%s)",
+                p.blendingMode, p.opacity,
+                p.clampedTint.x, p.clampedTint.y, p.clampedTint.z,
+                p.clampedScreen.x, p.clampedScreen.y, p.clampedScreen.z);
+            if (p.vertexOffset == 916 || p.vertexOffset == 1563 || p.vertexOffset == 1504) {
+                dumpText ~= format(" mm=(%s,%s,%s,%s) rm=(%s,%s,%s,%s)",
+                    p.modelMatrix[0], p.modelMatrix[5], p.modelMatrix[12], p.modelMatrix[13],
+                    p.renderMatrix[0], p.renderMatrix[5], p.renderMatrix[12], p.renderMatrix[13]);
+            }
             if (p.vertexCount > 0 &&
                 p.vertexOffset < snapshot.vertices.length &&
                 p.uvOffset < snapshot.uvs.length &&
@@ -428,6 +439,14 @@ private void dumpQueueFrame(string path, string dllFlavor, int frameIndex,
                 mhMask ^= hashFloatSlice(m.partPacket.renderMatrix.ptr, 16);
                 mhMask *= 1099511628211UL;
             }
+        } else if (cmd.kind == gfx.NjgRenderCommandKind.BeginDynamicComposite ||
+                   cmd.kind == gfx.NjgRenderCommandKind.EndDynamicComposite) {
+            const auto dp = cmd.dynamicPass;
+            dumpText ~= format(" tc=%s tex=(%s,%s,%s) st=%s drawBuf=%s hasSt=%s ovp=(%s,%s,%s,%s)",
+                dp.textureCount,
+                dp.textures[0], dp.textures[1], dp.textures[2],
+                dp.stencil, dp.drawBufferCount, dp.hasStencil,
+                dp.origViewport[0], dp.origViewport[1], dp.origViewport[2], dp.origViewport[3]);
         }
         dumpText ~= "\n";
     }
@@ -870,6 +889,15 @@ void main(string[] args) {
     foreach (name; libNames) {
         libCandidates ~= buildPath(exeDir, name);
         if (unityFlavor == "nicxlive") {
+            libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", name);
+            libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", name);
+            libCandidates ~= buildPath("..", "nicxlive", "build", name);
+            libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "RelWithDebInfo", name);
+            libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "RelWithDebInfo", name);
+            libCandidates ~= buildPath("..", "nicxlive", "build", "RelWithDebInfo", name);
+            libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "Release", name);
+            libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "Release", name);
+            libCandidates ~= buildPath("..", "nicxlive", "build", "Release", name);
             libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "Debug", name);
             libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "Debug", name);
             libCandidates ~= buildPath("..", "nicxlive", "build", "Debug", name);
