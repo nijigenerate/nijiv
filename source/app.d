@@ -883,18 +883,35 @@ void main(string[] args) {
     string[] libCandidates;
     foreach (name; libNames) {
         if (unityFlavor == "nicxlive") {
-            libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "Debug", name);
-            libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "Debug", name);
-            libCandidates ~= buildPath("..", "nicxlive", "build", "Debug", name);
-            libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "RelWithDebInfo", name);
-            libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "RelWithDebInfo", name);
-            libCandidates ~= buildPath("..", "nicxlive", "build", "RelWithDebInfo", name);
-            libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "Release", name);
-            libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "Release", name);
-            libCandidates ~= buildPath("..", "nicxlive", "build", "Release", name);
-            libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", name);
-            libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", name);
-            libCandidates ~= buildPath("..", "nicxlive", "build", name);
+            version (Windows) {
+                // Multi-config generators: prefer per-config output first.
+                libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "Debug", name);
+                libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "Debug", name);
+                libCandidates ~= buildPath("..", "nicxlive", "build", "Debug", name);
+                libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "RelWithDebInfo", name);
+                libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "RelWithDebInfo", name);
+                libCandidates ~= buildPath("..", "nicxlive", "build", "RelWithDebInfo", name);
+                libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "Release", name);
+                libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "Release", name);
+                libCandidates ~= buildPath("..", "nicxlive", "build", "Release", name);
+                libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", name);
+                libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", name);
+                libCandidates ~= buildPath("..", "nicxlive", "build", name);
+            } else {
+                // Single-config generators: build root artifact is the latest output.
+                libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", name);
+                libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", name);
+                libCandidates ~= buildPath("..", "nicxlive", "build", name);
+                libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "Debug", name);
+                libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "Debug", name);
+                libCandidates ~= buildPath("..", "nicxlive", "build", "Debug", name);
+                libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "RelWithDebInfo", name);
+                libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "RelWithDebInfo", name);
+                libCandidates ~= buildPath("..", "nicxlive", "build", "RelWithDebInfo", name);
+                libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "Release", name);
+                libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "Release", name);
+                libCandidates ~= buildPath("..", "nicxlive", "build", "Release", name);
+            }
         } else {
             libCandidates ~= buildPath(exeDir, name);
             libCandidates ~= buildPath(exeDir, "..", "nijilive", name);
