@@ -193,7 +193,6 @@ alias PuppetHandle = void*;
 // Keep in sync with nijilive/source/nijilive/integration/unity.d
 enum NjgRenderCommandKind : uint {
     DrawPart,
-    DrawMask,
     BeginDynamicComposite,
     EndDynamicComposite,
     BeginMask,
@@ -235,6 +234,7 @@ extern(C) struct NjgPartDrawPacket {
     size_t uvAtlasStride;
     size_t deformOffset;
     size_t deformAtlasStride;
+    size_t indexHandle;
     const(ushort)* indices;
     size_t indexCount;
     size_t vertexCount;
@@ -248,6 +248,7 @@ extern(C) struct NjgMaskDrawPacket {
     size_t vertexAtlasStride;
     size_t deformOffset;
     size_t deformAtlasStride;
+    size_t indexHandle;
     const(ushort)* indices;
     size_t indexCount;
     size_t vertexCount;
@@ -3174,9 +3175,6 @@ void renderCommands(const DirectXBackendInit* dx,
         switch (kind) {
             case cast(uint)NjgRenderCommandKind.DrawPart:
                 backend.drawPartPacket(cmd.partPacket, gTextures);
-                break;
-            case cast(uint)NjgRenderCommandKind.DrawMask:
-                backend.drawMaskPacket(cmd.maskApplyPacket.maskPacket);
                 break;
             case cast(uint)NjgRenderCommandKind.BeginDynamicComposite:
                 backend.beginDynamicComposite(cmd.dynamicPass);

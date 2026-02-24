@@ -20,6 +20,7 @@ version (OSX) {
 import std.algorithm.comparison : max;
 import std.algorithm.mutation : swap;
 import core.stdc.string : memcpy;
+import core.stdc.stdlib : getenv;
 
 // Composite backend removed; no-op imports.
 
@@ -126,16 +127,12 @@ alias RenderBackend = RenderingBackend;
 /// GPU command kinds; backends switch on these during rendering.
 enum RenderCommandKind {
     DrawPart,
-    DrawMask,
     BeginDynamicComposite,
     EndDynamicComposite,
     BeginMask,
     ApplyMask,
     BeginMaskContent,
     EndMask,
-    BeginComposite,
-    DrawCompositeQuad,
-    EndComposite,
 }
 
 enum MaskDrawableKind {
@@ -586,15 +583,33 @@ import inmath.linalg : rect;
 
 class RenderingBackend {
     private struct IboKey {
-        size_t ptr;
+        ulong hash;
         size_t count;
         bool opEquals(ref const IboKey other) const nothrow @safe {
+            return hash == other.hash && count == other.count;
+        }
+        size_t toHash() const nothrow @safe {
+            auto h = cast(size_t)hash;
+            return (h ^ (count + 0x9e3779b97f4a7c15UL + (h << 6) + (h >> 2)));
+        }
+    }
+    private struct IboPtrKey {
+        size_t ptr;
+        size_t count;
+        bool opEquals(ref const IboPtrKey other) const nothrow @safe {
             return ptr == other.ptr && count == other.count;
         }
         size_t toHash() const nothrow @safe {
-            // simple pointer/count mix; sufficient for stable index buffers
             return (ptr ^ (count + 0x9e3779b97f4a7c15UL + (ptr << 6) + (ptr >> 2)));
         }
+    }
+    private struct IboPtrEntry {
+        RenderResourceHandle handle;
+        ulong quickSig;
+    }
+    private struct IboHandleEntry {
+        size_t count;
+        ulong quickSig;
     }
 
     private struct IndexRange {
@@ -683,6 +698,29 @@ class RenderingBackend {
     private int[] viewportHeightStack;
 
     private RenderResourceHandle[IboKey] iboCache;
+    private IboPtrEntry[IboPtrKey] iboPtrCache;
+    private IboHandleEntry[RenderResourceHandle] iboHandleCache;
+
+    private static ulong quickIndexSignature(const(ushort)[] idx) @safe nothrow {
+        ulong h = 1469598103934665603UL;
+        if (idx.length == 0) return h;
+        size_t[8] picks = [
+            0,
+            idx.length / 7,
+            (idx.length * 2) / 7,
+            (idx.length * 3) / 7,
+            (idx.length * 4) / 7,
+            (idx.length * 5) / 7,
+            (idx.length * 6) / 7,
+            idx.length - 1
+        ];
+        foreach (p; picks) {
+            auto v = idx[p];
+            h ^= cast(ulong)v;
+            h *= 1099511628211UL;
+        }
+        return h;
+    }
 
 public:
     void bindPartShader() {
@@ -867,16 +905,54 @@ public:
 
     RenderResourceHandle getOrCreateIbo(const(ushort)* indices, size_t count) {
         if (indices is null || count == 0) return RenderResourceHandle.init;
-        IboKey key = IboKey(cast(size_t)indices, count);
+        auto idxSlice = indices[0 .. count];
+        auto ptrKey = IboPtrKey(cast(size_t)indices, count);
+        auto qsig = quickIndexSignature(idxSlice);
+        if (auto ptrHit = ptrKey in iboPtrCache) {
+            if (ptrHit.quickSig == qsig) {
+                return ptrHit.handle;
+            }
+        }
+        ulong h = 1469598103934665603UL;
+        foreach (v; idxSlice) {
+            h ^= cast(ulong)v;
+            h *= 1099511628211UL;
+        }
+        IboKey key = IboKey(h, count);
         if (auto existing = key in iboCache) {
+            iboPtrCache[ptrKey] = IboPtrEntry(*existing, qsig);
             return *existing;
         }
         RenderResourceHandle ibo;
         createDrawableBuffers(ibo);
-        auto idxSlice = indices[0 .. count];
         uploadDrawableIndices(ibo, idxSlice);
         iboCache[key] = ibo;
+        iboPtrCache[ptrKey] = IboPtrEntry(ibo, qsig);
         return ibo;
+    }
+
+    RenderResourceHandle getOrCreateIboByHandle(RenderResourceHandle handle, const(ushort)* indices, size_t count) {
+        if (indices is null || count == 0) return RenderResourceHandle.init;
+        if (handle == 0) {
+            return getOrCreateIbo(indices, count);
+        }
+
+        auto idxSlice = indices[0 .. count];
+        auto qsig = quickIndexSignature(idxSlice);
+        if (auto cached = handle in iboHandleCache) {
+            if (cached.count == count && cached.quickSig == qsig) {
+                return handle;
+            }
+        }
+
+        if (handle >= nextIndexHandle) {
+            nextIndexHandle = handle + 1;
+        }
+        auto ibo = handle;
+        createDrawableBuffers(ibo);
+        uploadDrawableIndices(ibo, idxSlice);
+        iboHandleCache[handle] = IboHandleEntry(count, qsig);
+        return handle;
     }
 
     void rebindActiveTargets() {
@@ -1959,7 +2035,7 @@ private:
         glBindBuffer(GL_ARRAY_BUFFER, sharedDbo);
         glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 0, cast(void*)deformLane1Offset);
 
-        auto ibo = getOrCreateIbo(packet.indices, packet.indexCount);
+        auto ibo = getOrCreateIboByHandle(packet.indexHandle, packet.indices, packet.indexCount);
         drawDrawableElements(ibo, packet.indexCount);
         glDisableVertexAttribArray(0);
         glDisableVertexAttribArray(1);
@@ -2159,7 +2235,7 @@ private:
     }
 
     void renderStage(ref const(NjgPartDrawPacket) packet, bool advanced) {
-        auto ibo = getOrCreateIbo(packet.indices, packet.indexCount);
+        auto ibo = getOrCreateIboByHandle(packet.indexHandle, packet.indices, packet.indexCount);
         auto indexCount = cast(uint)packet.indexCount;
 
         if (!ibo || indexCount == 0 || packet.vertexCount == 0) return;
@@ -2262,16 +2338,12 @@ enum NjgResult : int {
 
 enum NjgRenderCommandKind : uint {
     DrawPart,
-    DrawMask, // align with RenderCommandKind; queue may not emit but keeps ABI in sync
     BeginDynamicComposite,
     EndDynamicComposite,
     BeginMask,
     ApplyMask,
     BeginMaskContent,
     EndMask,
-    BeginComposite,
-    DrawCompositeQuad,
-    EndComposite,
 }
 extern(C) struct UnityRendererConfig {
     int viewportWidth;
@@ -2306,6 +2378,7 @@ extern(C) struct NjgPartDrawPacket {
     size_t uvAtlasStride;
     size_t deformOffset;
     size_t deformAtlasStride;
+    size_t indexHandle;
     const(ushort)* indices;
     size_t indexCount;
     size_t vertexCount;
@@ -2319,6 +2392,7 @@ extern(C) struct NjgMaskDrawPacket {
     size_t vertexAtlasStride;
     size_t deformOffset;
     size_t deformAtlasStride;
+    size_t indexHandle;
     const(ushort)* indices;
     size_t indexCount;
     size_t vertexCount;
@@ -2387,6 +2461,8 @@ struct OpenGLBackendInit {
 }
 
 __gshared Texture[size_t] gTextures; // Unity handle -> nlshim Texture
+__gshared size_t gUnityCreateLogCount = 0;
+__gshared size_t gUnityUpdateLogCount = 0;
 __gshared size_t gNextHandle = 1;
 __gshared bool gBackendInitialized;
 __gshared RenderResourceHandle[DynamicCompositeFramebufferKey] gDynamicFramebufferCache;
@@ -2534,6 +2610,11 @@ OpenGLBackendInit initOpenGLBackend(int width, int height, bool isTest) {
         // Disable mipmaps (min filter is linear-only) to ensure level 0 is displayed.
         auto tex = new Texture(w, h, channels, stencil, false);
         gTextures[handle] = tex;
+        if (gUnityCreateLogCount < 256) {
+            import std.stdio : writefln;
+            writefln("[nijiv][unity-cb] create h=%s w=%s h=%s ch=%s rt=%s st=%s", handle, w, h, channels, renderTarget, stencil);
+            gUnityCreateLogCount++;
+        }
         return handle;
     };
     cbs.updateTexture = (size_t handle, const(ubyte)* data, size_t dataLen, int w, int h, int channels, void* userData) {
@@ -2542,7 +2623,14 @@ OpenGLBackendInit initOpenGLBackend(int width, int height, bool isTest) {
             return;
         }
         size_t expected = cast(size_t)w * cast(size_t)h * cast(size_t)channels;
+        if (gUnityUpdateLogCount < 256) {
+            import std.stdio : writefln;
+            writefln("[nijiv][unity-cb] update h=%s dataLen=%s w=%s h=%s ch=%s expected=%s", handle, dataLen, w, h, channels, expected);
+            gUnityUpdateLogCount++;
+        }
         if (data is null || expected == 0 || dataLen < expected) {
+            import std.stdio : writefln;
+            writefln("[nijiv][unity-cb] skip update h=%s data=%s dataLen=%s expected=%s", handle, data is null ? 0 : 1, dataLen, expected);
             return;
         }
         // Clamp/pad to exactly level0 size so GL upload always gets width*height*channels bytes.
@@ -2609,10 +2697,6 @@ void renderCommands(const OpenGLBackendInit* gl,
                 backend.drawPartPacket(cmd.partPacket, gTextures);
                 break;
             }
-            case NjgRenderCommandKind.DrawMask: {
-                // Not expected from current queue; keep placeholder for ABI completeness.
-                break;
-            }
             case NjgRenderCommandKind.BeginMask: {
                 backend.beginMask(cmd.usesStencil);
                 break;
@@ -2654,6 +2738,36 @@ void renderCommands(const OpenGLBackendInit* gl,
     }
     backend.postProcessScene();
     backend.presentSceneToBackbuffer(gl.drawableW, gl.drawableH);
+    // Optional framebuffer hash probe to confirm whether visual output drifts
+    // even when command/deform hashes stay constant.
+    static int traceFrameHash = -1;
+    if (traceFrameHash < 0) {
+        auto v = getenv("NJIV_TRACE_BACKBUFFER_HASH");
+        traceFrameHash = (v !is null && v[0] != '0') ? 1 : 0;
+    }
+    if (traceFrameHash != 0) {
+        static size_t frameNo = 0;
+        ++frameNo;
+        if ((frameNo % 60) == 0) {
+            ulong h = 1469598103934665603UL;
+            ubyte[4] px;
+            int w = gl.drawableW > 0 ? gl.drawableW : 1;
+            int hgt = gl.drawableH > 0 ? gl.drawableH : 1;
+            int[8] sx = [0, w / 7, (w * 2) / 7, (w * 3) / 7, (w * 4) / 7, (w * 5) / 7, (w * 6) / 7, w - 1];
+            int[8] sy = [0, hgt / 7, (hgt * 2) / 7, (hgt * 3) / 7, (hgt * 4) / 7, (hgt * 5) / 7, (hgt * 6) / 7, hgt - 1];
+            foreach (ix; 0 .. sx.length) {
+                auto x = sx[ix] < 0 ? 0 : (sx[ix] >= w ? w - 1 : sx[ix]);
+                auto y = sy[ix] < 0 ? 0 : (sy[ix] >= hgt ? hgt - 1 : sy[ix]);
+                glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px.ptr);
+                foreach (b; px) {
+                    h ^= cast(ulong)b;
+                    h *= 1099511628211UL;
+                }
+            }
+            import std.stdio : writeln;
+            writeln("[nijiv][bb-hash] frame=", frameNo, " hash=", h, " draws=", drawCount);
+        }
+    }
     // NOTE: Disabled per request. This debug overlay rewrites final pixels,
     // which interferes with transparent-window verification.
     // GLuint[] thumbTextureIds;
