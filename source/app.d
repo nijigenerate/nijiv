@@ -428,12 +428,19 @@ private void dumpQueueFrame(string path, string dllFlavor, int frameIndex,
             }
         } else if (cmd.kind == gfx.NjgRenderCommandKind.ApplyMask) {
             const auto m = cmd.maskApplyPacket;
+            dumpText ~= format(" mk=%s dodge=%s part(v=%s i=%s ih=%s th=(%s,%s,%s)) mask(v=%s i=%s ih=%s)",
+                cast(uint)m.kind, m.isDodge ? 1 : 0,
+                m.partPacket.vertexCount, m.partPacket.indexCount, m.partPacket.indexHandle,
+                m.partPacket.textureHandles[0], m.partPacket.textureHandles[1], m.partPacket.textureHandles[2],
+                m.maskPacket.vertexCount, m.maskPacket.indexCount, m.maskPacket.indexHandle);
             if (m.kind == gfx.MaskDrawableKind.Part) {
                 mhMask ^= hashFloatSlice(m.partPacket.modelMatrix.ptr, 16);
                 mhMask *= 1099511628211UL;
                 mhMask ^= hashFloatSlice(m.partPacket.renderMatrix.ptr, 16);
                 mhMask *= 1099511628211UL;
             }
+        } else if (cmd.kind == gfx.NjgRenderCommandKind.BeginMask) {
+            dumpText ~= format(" usesStencil=%s", cmd.usesStencil ? 1 : 0);
         } else if (cmd.kind == gfx.NjgRenderCommandKind.BeginDynamicComposite ||
                    cmd.kind == gfx.NjgRenderCommandKind.EndDynamicComposite) {
             const auto dp = cmd.dynamicPass;
