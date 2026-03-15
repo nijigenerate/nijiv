@@ -4,9 +4,9 @@ import core.time : MonoTime, Duration, seconds;
 import std.conv : to;
 import std.exception : enforce;
 import std.file : exists, getcwd;
-import std.path : buildPath, dirName;
+import std.path : buildPath, dirName, baseName;
 import std.stdio : writeln, writefln, stderr;
-import std.string : fromStringz, toStringz, endsWith, toLower;
+import std.string : fromStringz, toStringz, endsWith, toLower, indexOf;
 import std.math : exp;
 import std.algorithm : clamp;
 
@@ -237,11 +237,23 @@ struct CliOptions {
     bool isTest = false;
     int framesFlag = -1;
     string unityDllFlavor;
+    string unityDllPath;
     ToggleOption transparentWindow = ToggleOption.Unspecified;
     ToggleOption transparentRetry = ToggleOption.Unspecified;
     ToggleOption transparentDebug = ToggleOption.Unspecified;
     string queueDumpPath;
     string[] positional;
+}
+
+private string inferUnityFlavorFromPath(string path) {
+    auto lowerName = baseName(path).toLower();
+    if (lowerName.length == 0) {
+        lowerName = path.toLower();
+    }
+    if (lowerName.indexOf("nicxlive") >= 0) {
+        return "nicxlive";
+    }
+    return "nijilive";
 }
 
 private __gshared bool gTransparentDebugLog = false;
@@ -321,9 +333,13 @@ private CliOptions parseCliOptions(string[] args) {
         }
         if (arg == "--unity-dll") {
             if (i + 1 < args.length) {
-                auto flavor = args[i + 1].toLower();
+                auto raw = args[i + 1];
+                auto flavor = raw.toLower();
                 if (flavor == "nijilive" || flavor == "nicxlive") {
                     out_.unityDllFlavor = flavor;
+                } else {
+                    out_.unityDllPath = raw;
+                    out_.unityDllFlavor = inferUnityFlavorFromPath(raw);
                 }
                 ++i;
             }
@@ -785,7 +801,7 @@ void main(string[] args) {
     int testMaxFrames = 5;
     auto testTimeout = 5.seconds;
     if (positional.length < 1) {
-        writeln("Usage: nijiv <puppet.inp|puppet.inx> [width height] [--test] [--frames N] [--unity-dll nijilive|nicxlive] [--queue-dump PATH] [--transparent-window|--no-transparent-window] [--transparent-window-retry|--no-transparent-window-retry] [--transparent-debug]");
+        writeln("Usage: nijiv <puppet.inp|puppet.inx> [width height] [--test] [--frames N] [--unity-dll nijilive|nicxlive|PATH] [--queue-dump PATH] [--transparent-window|--no-transparent-window] [--transparent-window-retry|--no-transparent-window-retry] [--transparent-debug]");
         return;
     }
     string puppetPath = resolvePuppetPath(positional[0]);
@@ -877,11 +893,16 @@ void main(string[] args) {
 
     // Resolve Unity-facing DLL flavor.
     string unityFlavor = cli.unityDllFlavor;
-    if (unityFlavor.length == 0) {
+    string explicitUnityDllPath = cli.unityDllPath;
+    if (explicitUnityDllPath.length == 0 && unityFlavor.length == 0) {
         if (auto p = getenv("NJIV_UNITY_DLL")) {
-            auto envFlavor = fromStringz(p).idup.toLower();
+            auto envRaw = fromStringz(p).idup;
+            auto envFlavor = envRaw.toLower();
             if (envFlavor == "nijilive" || envFlavor == "nicxlive") {
                 unityFlavor = envFlavor;
+            } else {
+                explicitUnityDllPath = envRaw;
+                unityFlavor = inferUnityFlavorFromPath(envRaw);
             }
         }
     }
@@ -891,68 +912,74 @@ void main(string[] args) {
 
     // Load the Unity-facing DLL from nearby build outputs.
     string exeDir = getcwd();
-    string[] libNames;
-    if (unityFlavor == "nicxlive") {
-        version (Windows) {
-            libNames = ["nicxlive.dll"];
-        } else version (linux) {
-            libNames = ["libnicxlive.so", "nicxlive.so"];
-        } else version (OSX) {
-            libNames = ["libnicxlive.dylib", "nicxlive.dylib"];
-        } else {
-            libNames = ["libnicxlive"];
-        }
-    } else {
-        libNames = unityLibraryNames();
-    }
+    string libPath;
+    bool unityDllExplicit = explicitUnityDllPath.length != 0;
     string[] libCandidates;
-    foreach (name; libNames) {
+    if (unityDllExplicit) {
+        libPath = explicitUnityDllPath;
+        enforce(exists(libPath), "Explicit unity DLL path not found: " ~ libPath);
+    } else {
+        string[] libNames;
         if (unityFlavor == "nicxlive") {
             version (Windows) {
-                // Multi-config generators: prefer per-config output first.
-                libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "Debug", name);
-                libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "Debug", name);
-                libCandidates ~= buildPath("..", "nicxlive", "build", "Debug", name);
-                libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "RelWithDebInfo", name);
-                libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "RelWithDebInfo", name);
-                libCandidates ~= buildPath("..", "nicxlive", "build", "RelWithDebInfo", name);
-                libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "Release", name);
-                libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "Release", name);
-                libCandidates ~= buildPath("..", "nicxlive", "build", "Release", name);
-                libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", name);
-                libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", name);
-                libCandidates ~= buildPath("..", "nicxlive", "build", name);
+                libNames = ["nicxlive.dll"];
+            } else version (linux) {
+                libNames = ["libnicxlive.so", "nicxlive.so"];
+            } else version (OSX) {
+                libNames = ["libnicxlive.dylib", "nicxlive.dylib"];
             } else {
-                // Single-config generators: build root artifact is the latest output.
-                libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", name);
-                libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", name);
-                libCandidates ~= buildPath("..", "nicxlive", "build", name);
-                libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "Debug", name);
-                libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "Debug", name);
-                libCandidates ~= buildPath("..", "nicxlive", "build", "Debug", name);
-                libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "RelWithDebInfo", name);
-                libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "RelWithDebInfo", name);
-                libCandidates ~= buildPath("..", "nicxlive", "build", "RelWithDebInfo", name);
-                libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "Release", name);
-                libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "Release", name);
-                libCandidates ~= buildPath("..", "nicxlive", "build", "Release", name);
+                libNames = ["libnicxlive"];
             }
         } else {
-            libCandidates ~= buildPath(exeDir, name);
-            libCandidates ~= buildPath(exeDir, "..", "nijilive", name);
-            libCandidates ~= buildPath(exeDir, "..", "..", "nijilive", name);
-            libCandidates ~= buildPath("..", "nijilive", name);
+            libNames = unityLibraryNames();
         }
-    }
-    string libPath;
-    foreach (c; libCandidates) {
-        if (exists(c)) {
-            libPath = c;
-            break;
+        foreach (name; libNames) {
+            if (unityFlavor == "nicxlive") {
+                version (Windows) {
+                    // Multi-config generators: prefer per-config output first.
+                    libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "RelWithDebInfo", name);
+                    libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "RelWithDebInfo", name);
+                    libCandidates ~= buildPath("..", "nicxlive", "build", "RelWithDebInfo", name);
+                    libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "Release", name);
+                    libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "Release", name);
+                    libCandidates ~= buildPath("..", "nicxlive", "build", "Release", name);
+                    libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", name);
+                    libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", name);
+                    libCandidates ~= buildPath("..", "nicxlive", "build", name);
+                    libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "Debug", name);
+                    libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "Debug", name);
+                    libCandidates ~= buildPath("..", "nicxlive", "build", "Debug", name);
+                } else {
+                    // Single-config generators: build root artifact is the latest output.
+                    libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", name);
+                    libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", name);
+                    libCandidates ~= buildPath("..", "nicxlive", "build", name);
+                    libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "Debug", name);
+                    libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "Debug", name);
+                    libCandidates ~= buildPath("..", "nicxlive", "build", "Debug", name);
+                    libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "RelWithDebInfo", name);
+                    libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "RelWithDebInfo", name);
+                    libCandidates ~= buildPath("..", "nicxlive", "build", "RelWithDebInfo", name);
+                    libCandidates ~= buildPath(exeDir, "..", "nicxlive", "build", "Release", name);
+                    libCandidates ~= buildPath(exeDir, "..", "..", "nicxlive", "build", "Release", name);
+                    libCandidates ~= buildPath("..", "nicxlive", "build", "Release", name);
+                }
+            } else {
+                libCandidates ~= buildPath(exeDir, name);
+                libCandidates ~= buildPath(exeDir, "..", "nijilive", name);
+                libCandidates ~= buildPath(exeDir, "..", "..", "nijilive", name);
+                libCandidates ~= buildPath("..", "nijilive", name);
+            }
         }
+        foreach (c; libCandidates) {
+            if (exists(c)) {
+                libPath = c;
+                break;
+            }
+        }
+        enforce(libPath.length > 0, "Could not find unity library for flavor=" ~ unityFlavor ~ " (searched: "~libCandidates.to!string~")");
     }
-    enforce(libPath.length > 0, "Could not find unity library for flavor=" ~ unityFlavor ~ " (searched: "~libCandidates.to!string~")");
-    writefln("[unity] flavor=%s path=%s", unityFlavor, libPath);
+    writefln("[unity] flavor=%s path=%s%s", unityFlavor, libPath, unityDllExplicit ? " (explicit)" : "");
     auto api = loadUnityApi(libPath);
     // Do not unload the shared runtime-bound DLL during process lifetime.
     if (api.rtInit !is null) api.rtInit();
