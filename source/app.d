@@ -70,6 +70,12 @@ alias FnSetLogCallback = extern(C) void function(NjgLogFn, void*);
 alias FnRtInit = extern(C) void function();
 alias FnRtTerm = extern(C) void function();
 alias FnGetSharedBuffers = extern(C) gfx.NjgResult function(gfx.RendererHandle, gfx.SharedBufferSnapshot*);
+version (EnableVulkanBackend) {
+    alias FnGetSharedBufferState = extern(C) gfx.NjgResult function(gfx.RendererHandle, gfx.SharedBufferState*);
+} else version (EnableDirectXBackend) {
+} else {
+    alias FnGetSharedBufferState = extern(C) gfx.NjgResult function(gfx.RendererHandle, gfx.SharedBufferState*);
+}
 alias FnSetPuppetScale = extern(C) gfx.NjgResult function(gfx.PuppetHandle, float, float);
 
 struct UnityApi {
@@ -84,6 +90,12 @@ struct UnityApi {
     FnFlushCommandBuffer flushCommands;
     FnSetLogCallback setLogCallback;
     FnGetSharedBuffers getSharedBuffers;
+    version (EnableVulkanBackend) {
+        FnGetSharedBufferState getSharedBufferState;
+    } else version (EnableDirectXBackend) {
+    } else {
+        FnGetSharedBufferState getSharedBufferState;
+    }
     FnRtInit rtInit;
     FnRtTerm rtTerm;
     FnSetPuppetScale setPuppetScale;
@@ -151,6 +163,12 @@ UnityApi loadUnityApi(string libPath) {
     api.flushCommands = loadSymbol!FnFlushCommandBuffer(lib, "njgFlushCommandBuffer");
     api.setLogCallback = loadOptionalSymbol!FnSetLogCallback(lib, "njgSetLogCallback");
     api.getSharedBuffers = loadSymbol!FnGetSharedBuffers(lib, "njgGetSharedBuffers");
+    version (EnableVulkanBackend) {
+        api.getSharedBufferState = loadOptionalSymbol!FnGetSharedBufferState(lib, "njgGetSharedBufferState");
+    } else version (EnableDirectXBackend) {
+    } else {
+        api.getSharedBufferState = loadOptionalSymbol!FnGetSharedBufferState(lib, "njgGetSharedBufferState");
+    }
     api.setPuppetScale = loadOptionalSymbol!FnSetPuppetScale(lib, "njgSetPuppetScale");
     // Explicit runtime init/term provided by DLL.
     api.rtInit = loadOptionalSymbol!FnRtInit(lib, "njgRuntimeInit");
@@ -1089,8 +1107,27 @@ void main(string[] args) {
         gfx.SharedBufferSnapshot snapshot;
         enforce(api.getSharedBuffers(renderer, &snapshot) == gfx.NjgResult.Ok, "njgGetSharedBuffers failed");
         dumpQueueFrame(cli.queueDumpPath, unityFlavor, frameCount, &snapshot, &view);
-
-        gfx.renderCommands(&backendInit, &snapshot, &view);
+        version (EnableVulkanBackend) {
+            gfx.SharedBufferState sharedState = gfx.SharedBufferState.init;
+            if (api.getSharedBufferState !is null) {
+                auto stateRes = api.getSharedBufferState(renderer, &sharedState);
+                if (stateRes != gfx.NjgResult.Ok) {
+                    sharedState = gfx.SharedBufferState.init;
+                }
+            }
+            gfx.renderCommands(&backendInit, &snapshot, &view, &sharedState);
+        } else version (EnableDirectXBackend) {
+            gfx.renderCommands(&backendInit, &snapshot, &view);
+        } else {
+            gfx.SharedBufferState sharedState = gfx.SharedBufferState.init;
+            if (api.getSharedBufferState !is null) {
+                auto stateRes = api.getSharedBufferState(renderer, &sharedState);
+                if (stateRes != gfx.NjgResult.Ok) {
+                    sharedState = gfx.SharedBufferState.init;
+                }
+            }
+            gfx.renderCommands(&backendInit, &snapshot, &view, &sharedState);
+        }
 
         // Some SDL backends create/replace native subviews lazily after first render.
         // Re-apply transparency once to catch late-created view/layer objects.

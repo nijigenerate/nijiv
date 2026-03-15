@@ -47,6 +47,22 @@ struct Vec4f {
     float a;
 }
 
+enum ulong GeometrySignatureOffsetBasis = 1469598103934665603UL;
+enum ulong GeometrySignaturePrime = 1099511628211UL;
+
+private void mixGeometrySignature(ref ulong signature, const(void)* data, size_t bytes) {
+    if (data is null || bytes == 0) return;
+    auto raw = cast(const(ubyte)*)data;
+    foreach (i; 0 .. bytes) {
+        signature ^= cast(ulong)raw[i];
+        signature *= GeometrySignaturePrime;
+    }
+}
+
+private void mixGeometrySignatureValue(T)(ref ulong signature, scope const T value) {
+    mixGeometrySignature(signature, &value, T.sizeof);
+}
+
 struct DirectXRuntimeOptions {
     bool trace;
     bool debugLayer;
@@ -424,6 +440,11 @@ private:
     ushort[] cpuIndices;
     uint frameSeq;
     uint drawCalls;
+    uint uploadWindowStartMs;
+    size_t uploadWindowFrameCount;
+    size_t uploadWindowAnyFrames;
+    size_t uploadWindowVertexFrames;
+    size_t uploadWindowIndexFrames;
     bool inMaskPass;
     bool inMaskContent;
     bool maskUsesStencil;
@@ -512,6 +533,11 @@ private:
         size_t indexUploadCapacity = 0;
         size_t uploadedVertexBytes = 0;
         size_t uploadedIndexBytes = 0;
+        size_t uploadedVertexBytesThisFrame = 0;
+        size_t uploadedIndexBytesThisFrame = 0;
+        ulong frameGeometrySignature = GeometrySignatureOffsetBasis;
+        ulong uploadedGeometrySignature = 0;
+        bool uploadedGeometryValid = false;
         uint srvDescriptorSize = 0;
         uint srvDescriptorCapacity = 0;
         uint offscreenRtvDescriptorCapacity = 0;
@@ -1808,6 +1834,25 @@ float4 psMain(VSOutput input) : SV_TARGET {
             if (!initialized) return;
             auto vBytes = cast(size_t)(vertices.length * Vertex.sizeof);
             auto iBytes = cast(size_t)(indices.length * ushort.sizeof);
+            uploadedVertexBytesThisFrame = 0;
+            uploadedIndexBytesThisFrame = 0;
+
+            if (vBytes == 0 || iBytes == 0) {
+                uploadedVertexBytes = 0;
+                uploadedIndexBytes = 0;
+                uploadedGeometrySignature = 0;
+                uploadedGeometryValid = false;
+                return;
+            }
+
+            const bool canReuseUpload =
+                uploadedGeometryValid &&
+                uploadedGeometrySignature == frameGeometrySignature &&
+                uploadedVertexBytes == vBytes &&
+                uploadedIndexBytes == iBytes;
+            if (canReuseUpload) {
+                return;
+            }
 
             if (vBytes > 0) {
                 uploadData(vertexUploadBuffer, vertexUploadCapacity, vertices.ptr, vBytes, "vertexUpload");
@@ -1818,6 +1863,10 @@ float4 psMain(VSOutput input) : SV_TARGET {
 
             uploadedVertexBytes = vBytes;
             uploadedIndexBytes = iBytes;
+            uploadedVertexBytesThisFrame = vBytes;
+            uploadedIndexBytesThisFrame = iBytes;
+            uploadedGeometrySignature = frameGeometrySignature;
+            uploadedGeometryValid = true;
             if (vBytes > 0) {
                 vbView.BufferLocation = vertexUploadBuffer.value.GetGPUVirtualAddress();
                 vbView.SizeInBytes = cast(uint)vBytes;
@@ -2502,6 +2551,10 @@ float4 psMain(VSOutput input) : SV_TARGET {
             indexUploadCapacity = 0;
             uploadedVertexBytes = 0;
             uploadedIndexBytes = 0;
+            uploadedVertexBytesThisFrame = 0;
+            uploadedIndexBytesThisFrame = 0;
+            uploadedGeometrySignature = 0;
+            uploadedGeometryValid = false;
             srvHeapPtr = null;
             srvDescriptorSize = 0;
             srvDescriptorCapacity = 0;
@@ -2637,9 +2690,34 @@ public:
         return st;
     }
 
+    void noteUploadFrame(bool uploadedVertex, bool uploadedIndex) {
+        auto nowMs = SDL_GetTicks();
+        if (uploadWindowStartMs == 0) {
+            uploadWindowStartMs = nowMs;
+        }
+        uploadWindowFrameCount++;
+        if (uploadedVertex || uploadedIndex) uploadWindowAnyFrames++;
+        if (uploadedVertex) uploadWindowVertexFrames++;
+        if (uploadedIndex) uploadWindowIndexFrames++;
+        if (nowMs - uploadWindowStartMs >= 1000) {
+            writeln("[nijiv][directx-upload/sec] frames=", uploadWindowFrameCount,
+                " any=", uploadWindowAnyFrames,
+                " vertex=", uploadWindowVertexFrames,
+                " index=", uploadWindowIndexFrames);
+            uploadWindowStartMs = nowMs;
+            uploadWindowFrameCount = 0;
+            uploadWindowAnyFrames = 0;
+            uploadWindowVertexFrames = 0;
+            uploadWindowIndexFrames = 0;
+        }
+    }
+
     void beginScene() {
         dxTrace("beginScene");
         dx.beginFrame();
+        dx.frameGeometrySignature = GeometrySignatureOffsetBasis;
+        dx.uploadedVertexBytesThisFrame = 0;
+        dx.uploadedIndexBytesThisFrame = 0;
         cpuVertices.length = 0;
         cpuIndices.length = 0;
         drawSpans.length = 0;
@@ -2748,6 +2826,7 @@ public:
             v.u = uvs.data[uxBase + i];
             v.v = uvs.data[uyBase + i];
             cpuVertices ~= v;
+            mixGeometrySignatureValue(dx.frameGeometrySignature, v);
         }
 
         cpuIndices.reserve(cpuIndices.length + packet.indexCount);
@@ -2762,9 +2841,15 @@ public:
                 droppedTriangles++;
                 continue;
             }
-            cpuIndices ~= cast(ushort)(baseVertex + i0);
-            cpuIndices ~= cast(ushort)(baseVertex + i1);
-            cpuIndices ~= cast(ushort)(baseVertex + i2);
+            auto out0 = cast(ushort)(baseVertex + i0);
+            auto out1 = cast(ushort)(baseVertex + i1);
+            auto out2 = cast(ushort)(baseVertex + i2);
+            cpuIndices ~= out0;
+            cpuIndices ~= out1;
+            cpuIndices ~= out2;
+            mixGeometrySignatureValue(dx.frameGeometrySignature, out0);
+            mixGeometrySignatureValue(dx.frameGeometrySignature, out1);
+            mixGeometrySignatureValue(dx.frameGeometrySignature, out2);
         }
         if (droppedTriangles > 0 && isDxTraceEnabled()) {
             dxTrace("drawPartPacket.droppedTriangles=" ~ to!string(droppedTriangles) ~
@@ -2860,6 +2945,7 @@ public:
             v.u = 0.0f;
             v.v = 0.0f;
             cpuVertices ~= v;
+            mixGeometrySignatureValue(dx.frameGeometrySignature, v);
         }
 
         auto firstIndex = cast(uint)cpuIndices.length;
@@ -2874,9 +2960,15 @@ public:
                 droppedTriangles++;
                 continue;
             }
-            cpuIndices ~= cast(ushort)(baseVertex + i0);
-            cpuIndices ~= cast(ushort)(baseVertex + i1);
-            cpuIndices ~= cast(ushort)(baseVertex + i2);
+            auto out0 = cast(ushort)(baseVertex + i0);
+            auto out1 = cast(ushort)(baseVertex + i1);
+            auto out2 = cast(ushort)(baseVertex + i2);
+            cpuIndices ~= out0;
+            cpuIndices ~= out1;
+            cpuIndices ~= out2;
+            mixGeometrySignatureValue(dx.frameGeometrySignature, out0);
+            mixGeometrySignatureValue(dx.frameGeometrySignature, out1);
+            mixGeometrySignatureValue(dx.frameGeometrySignature, out2);
         }
         if (droppedTriangles > 0 && isDxTraceEnabled()) {
             dxTrace("drawMaskPacket.droppedTriangles=" ~ to!string(droppedTriangles) ~
@@ -2987,7 +3079,6 @@ public:
     void applyMask(ref const(NjgMaskApplyPacket) packet, Texture[size_t] texturesByHandle) {
         forceStencilWrite = true;
         forceStencilRef = packet.isDodge ? cast(ubyte)0 : cast(ubyte)1;
-        maskContentStencilRef = forceStencilRef;
         final switch (packet.kind) {
             case MaskDrawableKind.Part:
                 NjgPartDrawPacket masked = packet.partPacket;
@@ -3001,6 +3092,9 @@ public:
     }
     void beginMaskContent() {
         inMaskContent = true;
+        // Match the native/OpenGL mask contract:
+        // content is always drawn where stencil == 1.
+        maskContentStencilRef = 1;
     }
     void endMask() {
         inMaskPass = false;
@@ -3013,6 +3107,7 @@ public:
     void endScene() {
         dxTrace("endScene.uploadGeometry");
         dx.uploadGeometry(cpuVertices, cpuIndices);
+        noteUploadFrame(dx.uploadedVertexBytesThisFrame > 0, dx.uploadedIndexBytesThisFrame > 0);
         if (isDxTraceEnabled()) {
             dxTrace("endScene.counts vertices=" ~ to!string(cpuVertices.length) ~
                 " indices=" ~ to!string(cpuIndices.length) ~
@@ -3047,8 +3142,8 @@ public:
                 " draws=", drawCalls,
                 " vertices=", cpuVertices.length,
                 " indices=", cpuIndices.length,
-                " uploadV=", dx.uploadedVertexBytes,
-                " uploadI=", dx.uploadedIndexBytes,
+                " uploadV=", dx.uploadedVertexBytesThisFrame,
+                " uploadI=", dx.uploadedIndexBytesThisFrame,
                 " heap=", heapType);
         }
     }

@@ -3,6 +3,7 @@ module opengl.opengl_backend;
 import std.exception : enforce;
 import std.string : fromStringz;
 import std.conv : to;
+import std.stdio : writefln;
 
 import bindbc.sdl;
 import bindbc.opengl;
@@ -627,6 +628,9 @@ class RenderingBackend {
     private GLuint sharedDeformBuffer;
     private GLuint sharedVertexBuffer;
     private GLuint sharedUvBuffer;
+    private size_t lastSharedVertexRevision;
+    private size_t lastSharedUvRevision;
+    private size_t lastSharedDeformRevision;
     private GLuint presentVao;
     private GLuint presentVbo;
     private GLuint presentProgram;
@@ -993,6 +997,25 @@ public:
             glGenBuffers(1, &sharedDeformBuffer);
         }
         return sharedDeformBuffer;
+    }
+
+    private bool noteSharedBufferRevision(size_t revision, ref size_t lastRevision) {
+        if (revision == 0) return true;
+        if (lastRevision == revision) return false;
+        lastRevision = revision;
+        return true;
+    }
+
+    bool shouldUploadSharedVertex(size_t revision) {
+        return noteSharedBufferRevision(revision, lastSharedVertexRevision);
+    }
+
+    bool shouldUploadSharedUv(size_t revision) {
+        return noteSharedBufferRevision(revision, lastSharedUvRevision);
+    }
+
+    bool shouldUploadSharedDeform(size_t revision) {
+        return noteSharedBufferRevision(revision, lastSharedDeformRevision);
     }
 
     void beginScene() {
@@ -2445,6 +2468,12 @@ extern(C) struct SharedBufferSnapshot {
     size_t deformCount;
 }
 
+extern(C) struct SharedBufferState {
+    size_t vertexRevision;
+    size_t uvRevision;
+    size_t deformRevision;
+}
+
 extern(C) struct UnityResourceCallbacks {
     void* userData;
     size_t function(int width, int height, int channels, int mipLevels, int format, bool renderTarget, bool stencil, void* userData) createTexture;
@@ -2466,6 +2495,12 @@ __gshared size_t gUnityUpdateLogCount = 0;
 __gshared size_t gNextHandle = 1;
 __gshared bool gBackendInitialized;
 __gshared RenderResourceHandle[DynamicCompositeFramebufferKey] gDynamicFramebufferCache;
+__gshared uint gSharedUploadWindowStartMs = 0;
+__gshared size_t gSharedUploadFrameCount = 0;
+__gshared size_t gSharedUploadAnyFrames = 0;
+__gshared size_t gSharedUploadVertexFrames = 0;
+__gshared size_t gSharedUploadUvFrames = 0;
+__gshared size_t gSharedUploadDeformFrames = 0;
 // SDL preview window for texture bytes has been removed to avoid interference.
 
 private struct DynamicCompositeFramebufferKey {
@@ -2659,9 +2694,10 @@ OpenGLBackendInit initOpenGLBackend(int width, int height, bool isTest) {
 // ==== Rendering pipeline ====
 void renderCommands(const OpenGLBackendInit* gl,
                     const SharedBufferSnapshot* snapshot,
-                    const CommandQueueView* view)
+                    const CommandQueueView* view,
+                    const SharedBufferState* sharedState = null)
 {
-    if (gl is null) return;
+    if (gl is null || snapshot is null || view is null) return;
     auto backend = currentRenderBackend();
     auto debugTextureBackend = currentDebugTextureBackend();
 
@@ -2671,15 +2707,42 @@ void renderCommands(const OpenGLBackendInit* gl,
 
     // Unity provides SoA buffers including atlasStride (lane0 -> lane1).
     // Offsets/strides are already in command packets, so upload slices as-is.
-    auto uploadSoA = (GLuint target, const NjgBufferSlice slice) {
-        if (target == 0 || slice.data is null || slice.length == 0) return;
+    auto uploadSoA = (GLuint target, const NjgBufferSlice slice, bool shouldUpload) {
+        if (!shouldUpload || target == 0 || slice.data is null || slice.length == 0) return;
         glBindBuffer(GL_ARRAY_BUFFER, target);
         glBufferData(GL_ARRAY_BUFFER, slice.length * float.sizeof, cast(const(void)*)slice.data, GL_DYNAMIC_DRAW);
     };
 
-    uploadSoA(backend.sharedVertexBufferHandle(), snapshot.vertices);
-    uploadSoA(backend.sharedUvBufferHandle(), snapshot.uvs);
-    uploadSoA(backend.sharedDeformBufferHandle(), snapshot.deform);
+    const auto state = sharedState is null ? SharedBufferState.init : *sharedState;
+    const bool uploadedVertex = backend.shouldUploadSharedVertex(state.vertexRevision);
+    const bool uploadedUv = backend.shouldUploadSharedUv(state.uvRevision);
+    const bool uploadedDeform = backend.shouldUploadSharedDeform(state.deformRevision);
+    uploadSoA(backend.sharedVertexBufferHandle(), snapshot.vertices, uploadedVertex);
+    uploadSoA(backend.sharedUvBufferHandle(), snapshot.uvs, uploadedUv);
+    uploadSoA(backend.sharedDeformBufferHandle(), snapshot.deform, uploadedDeform);
+    auto nowMs = SDL_GetTicks();
+    if (gSharedUploadWindowStartMs == 0) {
+        gSharedUploadWindowStartMs = nowMs;
+    }
+    gSharedUploadFrameCount++;
+    if (uploadedVertex || uploadedUv || uploadedDeform) gSharedUploadAnyFrames++;
+    if (uploadedVertex) gSharedUploadVertexFrames++;
+    if (uploadedUv) gSharedUploadUvFrames++;
+    if (uploadedDeform) gSharedUploadDeformFrames++;
+    if (nowMs - gSharedUploadWindowStartMs >= 1000) {
+        writefln("[nijiv][opengl-upload/sec] frames=%s any=%s vertex=%s uv=%s deform=%s",
+            gSharedUploadFrameCount,
+            gSharedUploadAnyFrames,
+            gSharedUploadVertexFrames,
+            gSharedUploadUvFrames,
+            gSharedUploadDeformFrames);
+        gSharedUploadWindowStartMs = nowMs;
+        gSharedUploadFrameCount = 0;
+        gSharedUploadAnyFrames = 0;
+        gSharedUploadVertexFrames = 0;
+        gSharedUploadUvFrames = 0;
+        gSharedUploadDeformFrames = 0;
+    }
     backend.beginScene();
     // Core profile requires a VAO. Bind the shared VAO used by nlshim attributes.
     backend.bindDrawableVao();

@@ -5,6 +5,7 @@ version (EnableVulkanBackend) {
 import std.algorithm : min;
 import std.algorithm.comparison : max;
 import std.algorithm.searching : canFind;
+import std.array : join;
 import std.conv : to;
 import std.exception : enforce;
 import std.math : isNaN;
@@ -15,7 +16,7 @@ import core.thread : thread_attachThis;
 
 import core.stdc.string : memcpy;
 import core.stdc.stdint : uint32_t;
-import core.stdc.stdio : fprintf, stderr;
+import core.stdc.stdio : fflush, fprintf, stderr;
 
 import bindbc.sdl;
 import bindbc.sdl.bind.sdlvulkan;
@@ -42,6 +43,22 @@ struct Vec4f {
     float g;
     float b;
     float a;
+}
+
+enum ulong GeometrySignatureOffsetBasis = 1469598103934665603UL;
+enum ulong GeometrySignaturePrime = 1099511628211UL;
+
+private void mixGeometrySignature(ref ulong signature, const(void)* data, size_t bytes) {
+    if (data is null || bytes == 0) return;
+    auto raw = cast(const(ubyte)*)data;
+    foreach (i; 0 .. bytes) {
+        signature ^= cast(ulong)raw[i];
+        signature *= GeometrySignaturePrime;
+    }
+}
+
+private void mixGeometrySignatureValue(T)(ref ulong signature, scope const T value) {
+    mixGeometrySignature(signature, &value, T.sizeof);
 }
 
 public __gshared Vec4f inClearColor = Vec4f(0.0f, 0.0f, 0.0f, 0.0f);
@@ -193,6 +210,55 @@ extern(C) struct SharedBufferSnapshot {
     size_t deformCount;
 }
 
+extern(C) struct SharedBufferState {
+    size_t vertexRevision;
+    size_t uvRevision;
+    size_t deformRevision;
+}
+
+struct IboKey {
+    ulong hash;
+    size_t count;
+}
+
+struct CachedIndexBuffer {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    size_t capacity = 0;
+    size_t count = 0;
+    ulong quickSig = 0;
+}
+
+private static ulong quickIndexSignature(const(ushort)[] idx) @safe nothrow {
+    ulong h = 1469598103934665603UL;
+    if (idx.length == 0) return h;
+    size_t[8] picks = [
+        0,
+        idx.length / 7,
+        (idx.length * 2) / 7,
+        (idx.length * 3) / 7,
+        (idx.length * 4) / 7,
+        (idx.length * 5) / 7,
+        (idx.length * 6) / 7,
+        idx.length - 1
+    ];
+    foreach (p; picks) {
+        auto v = idx[p];
+        h ^= cast(ulong)v;
+        h *= 1099511628211UL;
+    }
+    return h;
+}
+
+private static ulong fullIndexHash(const(ushort)[] idx) @safe nothrow {
+    ulong h = 1469598103934665603UL;
+    foreach (v; idx) {
+        h ^= cast(ulong)v;
+        h *= 1099511628211UL;
+    }
+    return h;
+}
+
 extern(C) struct UnityResourceCallbacks {
     void* userData;
     size_t function(int width, int height, int channels, int mipLevels, int format, bool renderTarget, bool stencil, void* userData) createTexture;
@@ -229,14 +295,23 @@ enum PipelineKind : uint {
 }
 
 struct PushConstants {
+    float[16] mvp;
+    Vec2f origin;
+    float[2] pad0;
     float[4] tintOpacity;
     float[4] screenEmission;
 }
 
 struct DrawBatch {
+    VkBuffer indexBuffer;
     uint firstIndex;
     uint indexCount;
-    int vertexOffset;
+    size_t vertexOffset;
+    size_t vertexAtlasStride;
+    size_t uvOffset;
+    size_t uvAtlasStride;
+    size_t deformOffset;
+    size_t deformAtlasStride;
     PipelineKind pipelineKind;
     PushConstants pushConstants;
     size_t[3] textureHandles;
@@ -425,6 +500,12 @@ private Vec4f mulMat4Vec4(ref const(float[16]) m, float x, float y, float z, flo
     return Vec4f(r[0], r[1], r[2], r[3]);
 }
 
+private bool rangeInBounds(size_t base, size_t count, size_t length) {
+    if (count > length) return false;
+    if (base > length - count) return false;
+    return true;
+}
+
 private uint findMemoryType(VkPhysicalDevice phys,
                             uint typeFilter,
                             VkMemoryPropertyFlags properties)
@@ -531,6 +612,27 @@ private:
     VkBuffer indexBuffer;
     VkDeviceMemory indexMemory;
     size_t indexCapacity;
+    size_t uploadedVertexBytes;
+    size_t uploadedIndexBytes;
+    size_t uploadedVertexBytesThisFrame;
+    size_t uploadedIndexBytesThisFrame;
+    ulong frameGeometrySignature = GeometrySignatureOffsetBasis;
+    ulong uploadedGeometrySignature;
+    bool uploadedGeometryValid;
+    VkBuffer sharedVertexBuffer;
+    VkDeviceMemory sharedVertexMemory;
+    size_t sharedVertexCapacity;
+    size_t lastSharedVertexRevision;
+    VkBuffer sharedUvBuffer;
+    VkDeviceMemory sharedUvMemory;
+    size_t sharedUvCapacity;
+    size_t lastSharedUvRevision;
+    VkBuffer sharedDeformBuffer;
+    VkDeviceMemory sharedDeformMemory;
+    size_t sharedDeformCapacity;
+    size_t lastSharedDeformRevision;
+    CachedIndexBuffer[RenderResourceHandle] indexBuffersByHandle;
+    CachedIndexBuffer[IboKey] indexBuffersByContent;
 
     Vertex[] cpuVertices;
     ushort[] cpuIndices;
@@ -554,12 +656,22 @@ private:
     uint64_t diagFrame;
     uint32_t diagBeginDynZeroTarget;
     uint32_t diagDroppedDynToRoot;
+    uint32_t diagDrawCalls;
+    uint32_t diagSkippedBind;
+    uint32_t diagSkippedPipeline;
+    uint32_t diagSkippedDescriptor;
+    uint uploadWindowStartMs;
+    size_t uploadWindowFrameCount;
+    size_t uploadWindowAnyFrames;
+    size_t uploadWindowVertexFrames;
+    size_t uploadWindowIndexFrames;
     VkTextureResource[size_t] textureResources;
     VkTextureResource fallbackWhite;
     VkTextureResource fallbackBlack;
     bool textureMutationSynced;
 
     const(SharedBufferSnapshot)* currentSnapshot;
+    SharedBufferState currentSharedState;
 
 public:
     this(SDL_Window* window, bool isTest) {
@@ -588,6 +700,26 @@ public:
         if (vertexMemory != VK_NULL_HANDLE) vkFreeMemory(device, vertexMemory, null);
         if (indexBuffer != VK_NULL_HANDLE) vkDestroyBuffer(device, indexBuffer, null);
         if (indexMemory != VK_NULL_HANDLE) vkFreeMemory(device, indexMemory, null);
+        if (sharedVertexBuffer != VK_NULL_HANDLE) vkDestroyBuffer(device, sharedVertexBuffer, null);
+        if (sharedVertexMemory != VK_NULL_HANDLE) vkFreeMemory(device, sharedVertexMemory, null);
+        if (sharedUvBuffer != VK_NULL_HANDLE) vkDestroyBuffer(device, sharedUvBuffer, null);
+        if (sharedUvMemory != VK_NULL_HANDLE) vkFreeMemory(device, sharedUvMemory, null);
+        if (sharedDeformBuffer != VK_NULL_HANDLE) vkDestroyBuffer(device, sharedDeformBuffer, null);
+        if (sharedDeformMemory != VK_NULL_HANDLE) vkFreeMemory(device, sharedDeformMemory, null);
+        foreach (_k, ref entry; indexBuffersByHandle) {
+            if (entry.buffer != VK_NULL_HANDLE) vkDestroyBuffer(device, entry.buffer, null);
+            if (entry.memory != VK_NULL_HANDLE) vkFreeMemory(device, entry.memory, null);
+        }
+        foreach (_k, ref entry; indexBuffersByContent) {
+            if (entry.buffer != VK_NULL_HANDLE) vkDestroyBuffer(device, entry.buffer, null);
+            if (entry.memory != VK_NULL_HANDLE) vkFreeMemory(device, entry.memory, null);
+        }
+        indexBuffersByHandle.clear();
+        indexBuffersByContent.clear();
+        uploadedVertexBytes = 0;
+        uploadedIndexBytes = 0;
+        uploadedGeometrySignature = 0;
+        uploadedGeometryValid = false;
 
         foreach (i; 0 .. MaxFramesInFlight) {
             if (imageAvailable[i] != VK_NULL_HANDLE) vkDestroySemaphore(device, imageAvailable[i], null);
@@ -673,11 +805,101 @@ public:
         return 0;
     }
 
-    void setSharedSnapshot(const SharedBufferSnapshot* snapshot) {
+    void setSharedSnapshot(const SharedBufferSnapshot* snapshot, const SharedBufferState* sharedState = null) {
         currentSnapshot = snapshot;
+        currentSharedState = sharedState is null ? SharedBufferState.init : *sharedState;
+    }
+
+    private bool noteSharedBufferRevision(size_t revision, ref size_t lastRevision) {
+        if (revision == 0) return true;
+        if (lastRevision == revision) return false;
+        lastRevision = revision;
+        return true;
+    }
+
+    private void uploadSharedFloatBuffer(ref VkBuffer buffer,
+                                         ref VkDeviceMemory memory,
+                                         ref size_t capacity,
+                                         const(float)* data,
+                                         size_t length,
+                                         size_t revision,
+                                         ref size_t lastRevision,
+                                         ref size_t uploadedBytes)
+    {
+        uploadedBytes = 0;
+        if (data is null || length == 0) return;
+        if (!noteSharedBufferRevision(revision, lastRevision)) return;
+
+        auto bytes = length * float.sizeof;
+        recreateHostVisibleBuffer(buffer, memory, capacity, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, bytes);
+
+        void* mapped = null;
+        vkEnforce(vkMapMemory(device, memory, 0, bytes, 0, &mapped), "vkMapMemory shared buffer failed");
+        memcpy(mapped, data, bytes);
+        vkUnmapMemory(device, memory);
+        uploadedBytes = bytes;
+    }
+
+    private void ensureIndexBufferUploaded(ref CachedIndexBuffer entry, const(ushort)[] indices) {
+        auto bytes = indices.length * ushort.sizeof;
+        if (bytes == 0) return;
+        recreateHostVisibleBuffer(entry.buffer, entry.memory, entry.capacity, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, bytes);
+        void* mapped = null;
+        vkEnforce(vkMapMemory(device, entry.memory, 0, bytes, 0, &mapped), "vkMapMemory cached index failed");
+        memcpy(mapped, indices.ptr, bytes);
+        vkUnmapMemory(device, entry.memory);
+        entry.count = indices.length;
+        entry.quickSig = quickIndexSignature(indices);
+        uploadedIndexBytesThisFrame += bytes;
+        uploadedIndexBytes = uploadedIndexBytesThisFrame;
+    }
+
+    private VkBuffer getOrCreateIndexBufferByHandle(RenderResourceHandle handle, const(ushort)* indices, size_t count) {
+        if (indices is null || count == 0) return VK_NULL_HANDLE;
+        auto idxSlice = indices[0 .. count];
+        if (handle != 0) {
+            auto qsig = quickIndexSignature(idxSlice);
+            if (auto cached = handle in indexBuffersByHandle) {
+                if (cached.count == count && cached.quickSig == qsig) {
+                    return cached.buffer;
+                }
+                ensureIndexBufferUploaded(*cached, idxSlice);
+                return cached.buffer;
+            }
+            CachedIndexBuffer entry;
+            ensureIndexBufferUploaded(entry, idxSlice);
+            indexBuffersByHandle[handle] = entry;
+            return entry.buffer;
+        }
+
+        auto key = IboKey(fullIndexHash(idxSlice), count);
+        if (auto cached = key in indexBuffersByContent) {
+            return cached.buffer;
+        }
+        CachedIndexBuffer entry;
+        ensureIndexBufferUploaded(entry, idxSlice);
+        indexBuffersByContent[key] = entry;
+        return entry.buffer;
+    }
+
+    private bool bindBatchGeometry(VkCommandBuffer cmd, ref const(DrawBatch) b) {
+        if (b.indexCount == 0) return false;
+        if (vertexBuffer == VK_NULL_HANDLE || indexBuffer == VK_NULL_HANDLE) {
+            return false;
+        }
+        VkBuffer vb = vertexBuffer;
+        VkDeviceSize vbOffset = 0;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vbOffset);
+        vkCmdBindIndexBuffer(cmd, indexBuffer, 0, VK_INDEX_TYPE_UINT16);
+        return true;
     }
 
     void beginScene() {
+        frameGeometrySignature = GeometrySignatureOffsetBasis;
+        uploadedVertexBytesThisFrame = 0;
+        uploadedIndexBytesThisFrame = 0;
+        uploadedVertexBytes = 0;
+        uploadedIndexBytes = 0;
         textureMutationSynced = false;
         pruneTextureCache();
         cpuVertices.length = 0;
@@ -696,6 +918,35 @@ public:
         pendingMaskWriteReference = 1;
         diagBeginDynZeroTarget = 0;
         diagDroppedDynToRoot = 0;
+        diagDrawCalls = 0;
+        diagSkippedBind = 0;
+        diagSkippedPipeline = 0;
+        diagSkippedDescriptor = 0;
+    }
+
+    void noteUploadFrame(bool uploadedVertex, bool uploadedIndex) {
+        auto nowMs = SDL_GetTicks();
+        if (uploadWindowStartMs == 0) {
+            uploadWindowStartMs = nowMs;
+        }
+        uploadWindowFrameCount++;
+        if (uploadedVertex || uploadedIndex) uploadWindowAnyFrames++;
+        if (uploadedVertex) uploadWindowVertexFrames++;
+        if (uploadedIndex) uploadWindowIndexFrames++;
+        if (nowMs - uploadWindowStartMs >= 1000) {
+            fprintf(stderr,
+                "[nijiv][vulkan-upload/sec] frames=%llu any=%llu vertex=%llu index=%llu\n",
+                cast(ulong)uploadWindowFrameCount,
+                cast(ulong)uploadWindowAnyFrames,
+                cast(ulong)uploadWindowVertexFrames,
+                cast(ulong)uploadWindowIndexFrames);
+            fflush(stderr);
+            uploadWindowStartMs = nowMs;
+            uploadWindowFrameCount = 0;
+            uploadWindowAnyFrames = 0;
+            uploadWindowVertexFrames = 0;
+            uploadWindowIndexFrames = 0;
+        }
     }
 
     void postProcessScene() {
@@ -704,11 +955,53 @@ public:
 
     void endScene() {
         drawFrame();
+        noteUploadFrame(uploadedVertexBytesThisFrame > 0, uploadedIndexBytesThisFrame > 0);
         if (diagEnabled()) {
+            size_t rootBatches = 0;
+            size_t offscreenBatches = 0;
+            size_t[PipelineKind.Count] pipelineCounts;
+            string[] batchGroups;
+            foreach (ref b; batches) {
+                if (b.targetHandle == 0) {
+                    rootBatches++;
+                } else {
+                    offscreenBatches++;
+                }
+                pipelineCounts[cast(size_t)b.pipelineKind]++;
+            }
+            if (batches.length > 0) {
+                size_t i = 0;
+                while (i < batches.length && batchGroups.length < 16) {
+                    auto target = batches[i].targetHandle;
+                    auto clear = batches[i].clearTarget;
+                    auto kind = batches[i].pipelineKind;
+                    auto start = i;
+                    while (i < batches.length && batches[i].targetHandle == target) {
+                        i++;
+                    }
+                    batchGroups ~= (target == 0 ? "root" : ("tex" ~ target.to!string)) ~
+                        ":" ~ (i - start).to!string ~
+                        ":clear=" ~ (clear ? "1" : "0") ~
+                        ":kind=" ~ (cast(int)kind).to!string;
+                }
+            }
             diagStderr("frame=" ~ diagFrame.to!string ~
                 " beginDynZeroTarget=" ~ diagBeginDynZeroTarget.to!string ~
                 " droppedDynToRoot=" ~ diagDroppedDynToRoot.to!string ~
-                " batches=" ~ batches.length.to!string);
+                " batches=" ~ batches.length.to!string ~
+                " root=" ~ rootBatches.to!string ~
+                " offscreen=" ~ offscreenBatches.to!string ~
+                " draws=" ~ diagDrawCalls.to!string ~
+                " skipBind=" ~ diagSkippedBind.to!string ~
+                " skipPipe=" ~ diagSkippedPipeline.to!string ~
+                " skipDesc=" ~ diagSkippedDescriptor.to!string ~
+                " part=" ~ pipelineCounts[cast(size_t)PipelineKind.Part].to!string ~
+                " partMask=" ~ pipelineCounts[cast(size_t)PipelineKind.PartMask].to!string ~
+                " mask=" ~ pipelineCounts[cast(size_t)PipelineKind.Mask].to!string ~
+                " partStencilWrite=" ~ pipelineCounts[cast(size_t)PipelineKind.PartStencilWrite].to!string ~
+                " partStencilTest=" ~ pipelineCounts[cast(size_t)PipelineKind.PartStencilTest].to!string ~
+                " maskStencilWrite=" ~ pipelineCounts[cast(size_t)PipelineKind.MaskStencilWrite].to!string ~
+                " groups=" ~ batchGroups.join("|"));
             diagFrame++;
         }
     }
@@ -815,6 +1108,7 @@ public:
 
     void drawPartPacket(ref const(NjgPartDrawPacket) packet)
     {
+        if (!packet.renderable) return;
         if (packet.indexCount == 0 || packet.vertexCount == 0) return;
         if (currentSnapshot is null) return;
 
@@ -826,27 +1120,31 @@ public:
         if (packet.vertexAtlasStride == 0 || packet.uvAtlasStride == 0 || packet.deformAtlasStride == 0) return;
 
         auto vxBase = packet.vertexOffset;
+        if (packet.vertexOffset > size_t.max - packet.vertexAtlasStride) return;
         auto vyBase = packet.vertexOffset + packet.vertexAtlasStride;
         auto uxBase = packet.uvOffset;
+        if (packet.uvOffset > size_t.max - packet.uvAtlasStride) return;
         auto uyBase = packet.uvOffset + packet.uvAtlasStride;
         auto dxBase = packet.deformOffset;
+        if (packet.deformOffset > size_t.max - packet.deformAtlasStride) return;
         auto dyBase = packet.deformOffset + packet.deformAtlasStride;
 
-        if (vxBase + packet.vertexCount > vertices.length) return;
-        if (vyBase + packet.vertexCount > vertices.length) return;
-        if (uxBase + packet.vertexCount > uvs.length) return;
-        if (uyBase + packet.vertexCount > uvs.length) return;
-        if (dxBase + packet.vertexCount > deform.length) return;
-        if (dyBase + packet.vertexCount > deform.length) return;
-
+        if (!rangeInBounds(vxBase, packet.vertexCount, vertices.length)) return;
+        if (!rangeInBounds(vyBase, packet.vertexCount, vertices.length)) return;
+        if (!rangeInBounds(uxBase, packet.vertexCount, uvs.length)) return;
+        if (!rangeInBounds(uyBase, packet.vertexCount, uvs.length)) return;
+        if (!rangeInBounds(dxBase, packet.vertexCount, deform.length)) return;
+        if (!rangeInBounds(dyBase, packet.vertexCount, deform.length)) return;
+        if (packet.indices is null) return;
         auto mvp = mulMat4(packet.renderMatrix, packet.modelMatrix);
+        auto baseVertex = cast(uint)cpuVertices.length;
+        if (baseVertex > ushort.max) return;
+        if (packet.vertexCount - 1 > cast(size_t)(ushort.max - baseVertex)) return;
 
-        int baseVertex = cast(int)cpuVertices.length;
         cpuVertices.reserve(cpuVertices.length + packet.vertexCount);
         foreach (i; 0 .. packet.vertexCount) {
             auto px = vertices.data[vxBase + i] + deform.data[dxBase + i] - packet.origin.x;
             auto py = vertices.data[vyBase + i] + deform.data[dyBase + i] - packet.origin.y;
-
             auto clip = mulMat4Vec4(mvp, px, py, 0, 1);
             float invW = (clip.a == 0 || isNaN(clip.a)) ? 1.0f : 1.0f / clip.a;
 
@@ -856,76 +1154,90 @@ public:
             v.u = uvs.data[uxBase + i];
             v.v = uvs.data[uyBase + i];
             cpuVertices ~= v;
+            mixGeometrySignatureValue(frameGeometrySignature, v);
         }
 
-        if (packet.indices is null) return;
         auto firstIndex = cast(uint)cpuIndices.length;
+        auto triCount = packet.indexCount / 3;
         cpuIndices.reserve(cpuIndices.length + packet.indexCount);
-        foreach (i; 0 .. packet.indexCount) {
-            cpuIndices ~= packet.indices[i];
+        foreach (t; 0 .. triCount) {
+            auto i0 = packet.indices[t * 3 + 0];
+            auto i1 = packet.indices[t * 3 + 1];
+            auto i2 = packet.indices[t * 3 + 2];
+            if (i0 >= packet.vertexCount || i1 >= packet.vertexCount || i2 >= packet.vertexCount) {
+                continue;
+            }
+            auto out0 = cast(ushort)(baseVertex + i0);
+            auto out1 = cast(ushort)(baseVertex + i1);
+            auto out2 = cast(ushort)(baseVertex + i2);
+            cpuIndices ~= out0;
+            cpuIndices ~= out1;
+            cpuIndices ~= out2;
+            mixGeometrySignatureValue(frameGeometrySignature, out0);
+            mixGeometrySignatureValue(frameGeometrySignature, out1);
+            mixGeometrySignatureValue(frameGeometrySignature, out2);
         }
 
-        if (cpuIndices.length > firstIndex) {
-            DrawBatch base;
-            base.firstIndex = firstIndex;
-            base.indexCount = cast(uint)(cpuIndices.length - firstIndex);
-            base.vertexOffset = baseVertex;
-            base.pushConstants.tintOpacity = [packet.clampedTint.x, packet.clampedTint.y, packet.clampedTint.z, packet.opacity];
-            base.pushConstants.screenEmission = [packet.clampedScreen.x, packet.clampedScreen.y, packet.clampedScreen.z, packet.emissionStrength];
-            base.textureCount = min(packet.textureCount, packet.textureHandles.length);
-            foreach (i; 0 .. base.textureCount) {
-                base.textureHandles[i] = packet.textureHandles[i];
-            }
-            auto rawBlend = packet.blendingMode;
-            if (rawBlend >= 0 && rawBlend < cast(int)BlendMode.Count) {
-                base.blendMode = cast(BlendMode)rawBlend;
-            } else {
-                base.blendMode = BlendMode.Normal;
-            }
+        auto appended = cast(uint)cpuIndices.length - firstIndex;
+        if (appended == 0) return;
 
-            auto pushToTarget = (DrawBatch b, size_t targetHandle) {
-                if (targetHandle == 0 && dynamicCompositeStack.length > 0) {
-                    // Dynamic-composite scopes must never leak draws to root.
-                    diagDroppedDynToRoot++;
-                    return;
-                }
-                b.targetHandle = targetHandle;
-                b.clearTarget = clearActiveTarget;
-                clearActiveTarget = false;
-                b.dynamicDepth = cast(uint32_t)(dynamicCompositeStack.length / 4);
-                batches ~= b;
-            };
+        DrawBatch base;
+        base.indexBuffer = indexBuffer;
+        base.firstIndex = firstIndex;
+        base.indexCount = appended;
+        base.pushConstants.tintOpacity = [packet.clampedTint.x, packet.clampedTint.y, packet.clampedTint.z, packet.opacity];
+        base.pushConstants.screenEmission = [packet.clampedScreen.x, packet.clampedScreen.y, packet.clampedScreen.z, packet.emissionStrength];
+        base.textureCount = min(packet.textureCount, packet.textureHandles.length);
+        foreach (i; 0 .. base.textureCount) {
+            base.textureHandles[i] = packet.textureHandles[i];
+        }
+        auto rawBlend = packet.blendingMode;
+        if (rawBlend >= 0 && rawBlend < cast(int)BlendMode.Count) {
+            base.blendMode = cast(BlendMode)rawBlend;
+        } else {
+            base.blendMode = BlendMode.Normal;
+        }
 
-            if (maskBuildActive) {
-                auto b = base;
-                b.pipelineKind = PipelineKind.PartStencilWrite;
-                b.blendMode = BlendMode.Normal;
-                b.clearStencil = pendingMaskStencilClear;
-                b.clearStencilValue = pendingMaskStencilClearValue;
-                b.stencilReference = pendingMaskWriteReference;
-                pendingMaskStencilClear = false;
-                maskStencilWritten = true;
-                auto t = (activeTargetCount > 0) ? activeTargetHandles[0] : 0;
-                pushToTarget(b, t);
-            } else if (packet.isMask) {
-                auto b = base;
-                b.pipelineKind = PipelineKind.PartMask;
-                b.pushConstants.screenEmission[3] = packet.maskThreshold;
-                auto t = (activeTargetCount > 0) ? activeTargetHandles[0] : 0;
-                pushToTarget(b, t);
-            } else if (maskContentActive) {
-                auto b = base;
-                b.pipelineKind = PipelineKind.PartStencilTest;
-                b.stencilReference = 1;
-                auto t = (activeTargetCount > 0) ? activeTargetHandles[0] : 0;
-                pushToTarget(b, t);
-            } else {
-                auto t0 = (activeTargetCount > 0) ? activeTargetHandles[0] : 0;
-                // Use single-pass part shading for stability until full MRT/stencil parity.
-                auto b = base;
-                b.pipelineKind = PipelineKind.Part;
-                pushToTarget(b, t0);
+        auto pushToTarget = (DrawBatch b, size_t targetHandle) {
+            if (targetHandle == 0 && dynamicCompositeStack.length > 0) {
+                diagDroppedDynToRoot++;
+                return;
             }
+            b.targetHandle = targetHandle;
+            b.clearTarget = clearActiveTarget;
+            clearActiveTarget = false;
+            b.dynamicDepth = cast(uint32_t)(dynamicCompositeStack.length / 4);
+            batches ~= b;
+        };
+
+        if (maskBuildActive) {
+            auto b = base;
+            b.pipelineKind = PipelineKind.PartStencilWrite;
+            b.blendMode = BlendMode.Normal;
+            b.clearStencil = pendingMaskStencilClear;
+            b.clearStencilValue = pendingMaskStencilClearValue;
+            b.stencilReference = pendingMaskWriteReference;
+            pendingMaskStencilClear = false;
+            maskStencilWritten = true;
+            auto t = (activeTargetCount > 0) ? activeTargetHandles[0] : 0;
+            pushToTarget(b, t);
+        } else if (packet.isMask) {
+            auto b = base;
+            b.pipelineKind = PipelineKind.PartMask;
+            b.pushConstants.screenEmission[3] = packet.maskThreshold;
+            auto t = (activeTargetCount > 0) ? activeTargetHandles[0] : 0;
+            pushToTarget(b, t);
+        } else if (maskContentActive) {
+            auto b = base;
+            b.pipelineKind = PipelineKind.PartStencilTest;
+            b.stencilReference = 1;
+            auto t = (activeTargetCount > 0) ? activeTargetHandles[0] : 0;
+            pushToTarget(b, t);
+        } else {
+            auto t0 = (activeTargetCount > 0) ? activeTargetHandles[0] : 0;
+            auto b = base;
+            b.pipelineKind = PipelineKind.Part;
+            pushToTarget(b, t0);
         }
     }
 
@@ -938,64 +1250,88 @@ public:
         if (packet.vertexAtlasStride == 0 || packet.deformAtlasStride == 0) return;
 
         auto vxBase = packet.vertexOffset;
+        if (packet.vertexOffset > size_t.max - packet.vertexAtlasStride) return;
         auto vyBase = packet.vertexOffset + packet.vertexAtlasStride;
         auto dxBase = packet.deformOffset;
+        if (packet.deformOffset > size_t.max - packet.deformAtlasStride) return;
         auto dyBase = packet.deformOffset + packet.deformAtlasStride;
-        if (vxBase + packet.vertexCount > vertices.length) return;
-        if (vyBase + packet.vertexCount > vertices.length) return;
-        if (dxBase + packet.vertexCount > deform.length) return;
-        if (dyBase + packet.vertexCount > deform.length) return;
-
+        if (!rangeInBounds(vxBase, packet.vertexCount, vertices.length)) return;
+        if (!rangeInBounds(vyBase, packet.vertexCount, vertices.length)) return;
+        if (!rangeInBounds(dxBase, packet.vertexCount, deform.length)) return;
+        if (!rangeInBounds(dyBase, packet.vertexCount, deform.length)) return;
+        if (packet.indices is null) return;
         auto mvp = packet.mvp;
-        int baseVertex = cast(int)cpuVertices.length;
+        auto baseVertex = cast(uint)cpuVertices.length;
+        if (baseVertex > ushort.max) return;
+        if (packet.vertexCount - 1 > cast(size_t)(ushort.max - baseVertex)) return;
+
+        cpuVertices.reserve(cpuVertices.length + packet.vertexCount);
         foreach (i; 0 .. packet.vertexCount) {
             auto px = vertices.data[vxBase + i] + deform.data[dxBase + i] - packet.origin.x;
             auto py = vertices.data[vyBase + i] + deform.data[dyBase + i] - packet.origin.y;
             auto clip = mulMat4Vec4(mvp, px, py, 0, 1);
             float invW = (clip.a == 0 || isNaN(clip.a)) ? 1.0f : 1.0f / clip.a;
+
             Vertex v;
             v.x = clip.r * invW;
             v.y = clip.g * invW;
-            v.u = 0;
-            v.v = 0;
+            v.u = 0.0f;
+            v.v = 0.0f;
             cpuVertices ~= v;
+            mixGeometrySignatureValue(frameGeometrySignature, v);
         }
 
-        if (packet.indices is null) return;
         auto firstIndex = cast(uint)cpuIndices.length;
-        foreach (i; 0 .. packet.indexCount) {
-            cpuIndices ~= packet.indices[i];
+        auto triCount = packet.indexCount / 3;
+        cpuIndices.reserve(cpuIndices.length + packet.indexCount);
+        foreach (t; 0 .. triCount) {
+            auto i0 = packet.indices[t * 3 + 0];
+            auto i1 = packet.indices[t * 3 + 1];
+            auto i2 = packet.indices[t * 3 + 2];
+            if (i0 >= packet.vertexCount || i1 >= packet.vertexCount || i2 >= packet.vertexCount) {
+                continue;
+            }
+            auto out0 = cast(ushort)(baseVertex + i0);
+            auto out1 = cast(ushort)(baseVertex + i1);
+            auto out2 = cast(ushort)(baseVertex + i2);
+            cpuIndices ~= out0;
+            cpuIndices ~= out1;
+            cpuIndices ~= out2;
+            mixGeometrySignatureValue(frameGeometrySignature, out0);
+            mixGeometrySignatureValue(frameGeometrySignature, out1);
+            mixGeometrySignatureValue(frameGeometrySignature, out2);
         }
 
-        if (cpuIndices.length > firstIndex) {
-            DrawBatch b;
-            b.firstIndex = firstIndex;
-            b.indexCount = cast(uint)(cpuIndices.length - firstIndex);
-            b.vertexOffset = baseVertex;
-            if (maskBuildActive) {
-                b.pipelineKind = PipelineKind.MaskStencilWrite;
-                b.blendMode = BlendMode.Normal;
-                b.clearStencil = pendingMaskStencilClear;
-                b.clearStencilValue = pendingMaskStencilClearValue;
-                b.stencilReference = pendingMaskWriteReference;
-                pendingMaskStencilClear = false;
-                maskStencilWritten = true;
-            } else {
-                b.pipelineKind = PipelineKind.Mask;
-                b.blendMode = BlendMode.Normal;
-                b.stencilReference = 1;
-            }
-            b.pushConstants.tintOpacity = [1, 1, 1, 1];
-            b.pushConstants.screenEmission = [0, 0, 0, 1];
-            b.targetHandle = (activeTargetCount > 0) ? activeTargetHandles[0] : 0;
-            if (b.targetHandle == 0 && dynamicCompositeStack.length > 0) {
-                return;
-            }
-            b.clearTarget = clearActiveTarget;
-            clearActiveTarget = false;
-            b.dynamicDepth = cast(uint32_t)(dynamicCompositeStack.length / 4);
-            batches ~= b;
+        auto appended = cast(uint)cpuIndices.length - firstIndex;
+        if (appended == 0) return;
+
+        DrawBatch b;
+        b.indexBuffer = indexBuffer;
+        b.firstIndex = firstIndex;
+        b.indexCount = appended;
+        if (maskBuildActive) {
+            b.pipelineKind = PipelineKind.MaskStencilWrite;
+            b.blendMode = BlendMode.Normal;
+            b.clearStencil = pendingMaskStencilClear;
+            b.clearStencilValue = pendingMaskStencilClearValue;
+            b.stencilReference = pendingMaskWriteReference;
+            pendingMaskStencilClear = false;
+            maskStencilWritten = true;
+        } else {
+            b.pipelineKind = PipelineKind.Mask;
+            b.blendMode = BlendMode.Normal;
+            b.stencilReference = 1;
         }
+        b.pushConstants.tintOpacity = [1, 1, 1, 1];
+        b.pushConstants.screenEmission = [0, 0, 0, 1];
+        b.targetHandle = (activeTargetCount > 0) ? activeTargetHandles[0] : 0;
+        if (b.targetHandle == 0 && dynamicCompositeStack.length > 0) {
+            return;
+        }
+        b.clearTarget = clearActiveTarget;
+        clearActiveTarget = false;
+        b.dynamicDepth = cast(uint32_t)(dynamicCompositeStack.length / 4);
+        batches ~= b;
     }
 
 private:
@@ -1591,7 +1927,7 @@ private:
         createDescriptorResources();
 
         VkPushConstantRange pushRange;
-        pushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         pushRange.offset = 0;
         pushRange.size = PushConstants.sizeof;
 
@@ -2630,21 +2966,40 @@ private:
     }
 
     void uploadGeometry() {
-        auto vBytes = cpuVertices.length * Vertex.sizeof;
-        auto iBytes = cpuIndices.length * ushort.sizeof;
-        if (vBytes == 0 || iBytes == 0) return;
+        uploadedVertexBytesThisFrame = 0;
+        uploadedIndexBytesThisFrame = 0;
+        if (cpuVertices.length == 0 || cpuIndices.length == 0) {
+            uploadedVertexBytes = 0;
+            uploadedIndexBytes = 0;
+            return;
+        }
+        auto vertexBytes = cpuVertices.length * Vertex.sizeof;
+        auto indexBytes = cpuIndices.length * ushort.sizeof;
+        bool shouldUpload = !uploadedGeometryValid || uploadedGeometrySignature != frameGeometrySignature;
+        if (!shouldUpload) {
+            uploadedVertexBytes = 0;
+            uploadedIndexBytes = 0;
+            return;
+        }
 
-        ensureBufferCapacity(vBytes, iBytes);
+        ensureBufferCapacity(vertexBytes, indexBytes);
 
         void* mapped = null;
-        vkEnforce(vkMapMemory(device, vertexMemory, 0, vBytes, 0, &mapped), "vkMapMemory vertex failed");
-        memcpy(mapped, cpuVertices.ptr, vBytes);
+        vkEnforce(vkMapMemory(device, vertexMemory, 0, vertexBytes, 0, &mapped), "vkMapMemory(vertex) failed");
+        memcpy(mapped, cpuVertices.ptr, vertexBytes);
         vkUnmapMemory(device, vertexMemory);
 
         mapped = null;
-        vkEnforce(vkMapMemory(device, indexMemory, 0, iBytes, 0, &mapped), "vkMapMemory index failed");
-        memcpy(mapped, cpuIndices.ptr, iBytes);
+        vkEnforce(vkMapMemory(device, indexMemory, 0, indexBytes, 0, &mapped), "vkMapMemory(index) failed");
+        memcpy(mapped, cpuIndices.ptr, indexBytes);
         vkUnmapMemory(device, indexMemory);
+
+        uploadedGeometrySignature = frameGeometrySignature;
+        uploadedGeometryValid = true;
+        uploadedVertexBytes = vertexBytes;
+        uploadedIndexBytes = indexBytes;
+        uploadedVertexBytesThisFrame = vertexBytes;
+        uploadedIndexBytesThisFrame = indexBytes;
     }
 
     void recordCommandBuffer(VkCommandBuffer cmd, uint imageIndex) {
@@ -2711,10 +3066,6 @@ private:
             }
 
             if (vertexBuffer != VK_NULL_HANDLE && indexBuffer != VK_NULL_HANDLE) {
-                VkDeviceSize offset = 0;
-                vkCmdBindVertexBuffers(cmd, 0, 1, &vertexBuffer, &offset);
-                vkCmdBindIndexBuffer(cmd, indexBuffer, 0, VK_INDEX_TYPE_UINT16);
-
                 foreach (i; start .. stop) {
                     auto ref b = batches[i];
                     auto kind = b.pipelineKind;
@@ -2762,17 +3113,27 @@ private:
                     }
 
                     if (b.indexCount == 0) continue;
+                    if (!bindBatchGeometry(cmd, b)) {
+                        diagSkippedBind++;
+                        continue;
+                    }
 
                     auto pipeline = offscreen
                         ? offscreenPipelines[cast(size_t)kind][cast(size_t)b.blendMode]
                         : pipelines[cast(size_t)kind][cast(size_t)b.blendMode];
-                    if (pipeline == VK_NULL_HANDLE) continue;
+                    if (pipeline == VK_NULL_HANDLE) {
+                        diagSkippedPipeline++;
+                        continue;
+                    }
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
                     if (stencilKind && !offscreen) {
                         vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, b.stencilReference);
                     }
                     auto dset = allocateBatchDescriptorSet(b);
-                    if (dset == VK_NULL_HANDLE) continue;
+                    if (dset == VK_NULL_HANDLE) {
+                        diagSkippedDescriptor++;
+                        continue;
+                    }
                     vkCmdBindDescriptorSets(cmd,
                                             VK_PIPELINE_BIND_POINT_GRAPHICS,
                                             pipelineLayout,
@@ -2783,11 +3144,12 @@ private:
                                             null);
                     vkCmdPushConstants(cmd,
                                        pipelineLayout,
-                                       VK_SHADER_STAGE_FRAGMENT_BIT,
+                                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                        0,
                                        PushConstants.sizeof,
                                        &b.pushConstants);
-                    vkCmdDrawIndexed(cmd, b.indexCount, 1, b.firstIndex, b.vertexOffset, 0);
+                    vkCmdDrawIndexed(cmd, b.indexCount, 1, b.firstIndex, 0, 0);
+                    diagDrawCalls++;
                 }
             }
 
@@ -3045,13 +3407,14 @@ VulkanBackendInit initVulkanBackend(int width, int height, bool isTest) {
 /// Execute command queue on Vulkan backend.
 void renderCommands(const VulkanBackendInit* vk,
                     const SharedBufferSnapshot* snapshot,
-                    const CommandQueueView* view)
+                    const CommandQueueView* view,
+                    const SharedBufferState* sharedState = null)
 {
     ensureDThreadAttached();
     if (vk is null || vk.backend is null || view is null) return;
 
     auto backend = cast(RenderingBackend)vk.backend;
-    backend.setSharedSnapshot(snapshot);
+    backend.setSharedSnapshot(snapshot, sharedState);
     backend.beginScene();
 
     auto cmds = view.commands[0 .. view.count];

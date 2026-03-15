@@ -1,6 +1,12 @@
 #version 450
 layout(set = 0, binding = 0) uniform sampler2D albedoTex;
 layout(push_constant) uniform Push {
+    vec4 mvp0;
+    vec4 mvp1;
+    vec4 mvp2;
+    vec4 mvp3;
+    vec2 origin;
+    vec2 pad0;
     vec4 tintOpacity;
     vec4 screenEmission; // a=threshold
 } pc;

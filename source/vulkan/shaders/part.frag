@@ -3,6 +3,12 @@ layout(set = 0, binding = 0) uniform sampler2D albedoTex;
 layout(set = 0, binding = 1) uniform sampler2D emissiveTex;
 layout(set = 0, binding = 2) uniform sampler2D bumpTex;
 layout(push_constant) uniform Push {
+    vec4 mvp0;
+    vec4 mvp1;
+    vec4 mvp2;
+    vec4 mvp3;
+    vec2 origin;
+    vec2 pad0;
     vec4 tintOpacity;     // rgb=tint, a=opacity
     vec4 screenEmission;  // rgb=screen, a=emission
 } pc;
